@@ -1,0 +1,8 @@
+[package]
+name = "rpad"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gtk4 = { version = "0.9", package = "gtk4" }
+clap = { version = "4", features = ["derive"] }
