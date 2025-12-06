@@ -1,0 +1,77 @@
+let window_clone = window.clone();
+        window.connect_close_request(move |win| {
+            unsafe {
+                if let Some(doc_state_ptr) = win.data::<DocumentState>("rpad-doc-state") {
+                    let doc_state: &DocumentState = doc_state_ptr.as_ref();
+
+                    // If not dirty, allow normal close
+                    if !doc_state.is_dirty() {
+                        return glib::Propagation::Proceed;
+                    }
+
+                    // Document is dirty → prompt
+                    let win_for_dialog = win.clone();
+
+                    let dialog = gtk::MessageDialog::builder()
+                        .transient_for(&win_for_dialog)
+                        .modal(true)
+                        .message_type(gtk::MessageType::Question)
+                        .buttons(gtk::ButtonsType::None)
+                        .text("Do you want to save changes to this document before closing?")
+                        .secondary_text("If you don’t save, your changes will be lost.")
+                        .build();
+
+ 
+
+                    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+                    dialog.add_button("Don't Save", gtk::ResponseType::Reject);
+                    dialog.add_button("Save", gtk::ResponseType::Accept);
+
+                    dialog.connect_response(move |dialog, response| {
+                        match response {
+                            gtk::ResponseType::Accept => {
+                                // Save then close
+                                unsafe {
+                                    if let Some(doc_state_ptr) =
+                                        win_for_dialog.data::<DocumentState>("rpad-doc-state")
+                                    {
+                                        let doc_state: &DocumentState = doc_state_ptr.as_ref();
+
+                                        if let Some(path) = doc_state.path() {
+                                            // Save to existing path
+                                            if let Err(err) =
+                                                save_buffer_to_path(&win_for_dialog, &path)
+                                            {
+                                                eprintln!("Error saving file: {err}");
+                                            } else {
+                                                win_for_dialog.close();
+                                            }
+                                        } else {
+                                            // No path yet → Save As + close
+                                            save_as_with_dialog_and_then_close(&win_for_dialog);
+                                        }
+                                    }
+                                }
+                            }
+                            gtk::ResponseType::Reject => {
+                                // Don't save, just close
+                                win_for_dialog.close();
+                            }
+                            _ => {
+                                // Cancel → do nothing, keep window open
+                            }
+                        }
+
+                        dialog.close();
+                    });
+
+                    dialog.show();
+
+                    // We handled the event asynchronously; prevent immediate close
+                    glib::Propagation::Stop
+                } else {
+                    // No doc state → just close
+                    glib::Propagation::Proceed
+                }
+            }
+        });
