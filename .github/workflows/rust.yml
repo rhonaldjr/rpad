@@ -11,12 +11,15 @@ env:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+
+      - name: Build
+        working-directory: ./rpad
+        run: cargo build --verbose
+
+      - name: Run tests
+        working-directory: ./rpad
+        run: cargo test --verbose
