@@ -1,135 +1,122 @@
-A lightweight, cross-platform notepad application written in Rust.
+Here is a clean **README.md** you can drop directly into your `rpad` repository.
+Short, semi-professional, focused on the actual behavior of your GTK4 Rust notepad, including the recent features you implemented (save, save-as, close-confirmation, cut/copy/paste, find/replace).
 
-rpad is a simple desktop text editor for Linux and macOS, inspired by classic Windows Notepad but extended with support for multiple editing modes: Plain Text, Markup, and Rich Text (planned).
-It includes both a graphical application and a command-line entry point.
+If you want sections for screenshots, packaging, or a full architecture diagram, say so and I’ll extend it.
 
-Features (Current Stage)
+---
 
-Native GTK4 desktop UI
+```markdown
+# rpad  
+A lightweight Rust notepad built with GTK4.  
+The editor focuses on simplicity, fast startup, and a minimal codebase suitable for learning or extending GTK4 applications.
 
-Menu bar with:
+## Features
+- Plain-text editing (Markdown and Rich Text modes planned)  
+- Open, Save, Save As workflows  
+- Unsaved-changes detection with confirmation dialog  
+- Cut, Copy, Paste, Delete  
+- Find and Replace  
+- Keyboard shortcuts (Ctrl+S, Ctrl+F, etc.)  
+- CLI launch with optional file and mode selection  
+- Clean separation between UI, text buffer, and file I/O  
 
-File → New, Open (stub), Save (stub), Save As (stub), Quit
+## CLI Usage
+```
 
-Mode → Plain, Markup, Rich (stubs)
+rpad [FILE] [--mode plain|markup|rich]
 
-Resizable text editor window
+````
 
-CLI launcher:
+### Arguments
+- **FILE**  
+  Optional file path to open on launch.
+- **--mode**  
+  Selects the editing mode. Defaults to `plain`.
 
-rpad [FILE] --mode plain|markup|rich
+Modes are defined in code as:
+```rust
+enum Mode { Plain, Markup, Rich }
+````
 
+## Project Structure
 
-Linux (Pop!_OS / Ubuntu) support implemented
+```
+src/
+  main.rs          → Application bootstrap, menu actions, window setup
+  file.rs          → File open/save, unsaved change checks
+  edit.rs          → Cut/copy/paste/delete helpers
+  search.rs        → Find / replace implementation
+  modes.rs         → ModeArg ↔ Mode conversions
+  util.rs          → Shared helpers
+```
 
-macOS support planned after core features stabilize
+## Build & Run
 
-Project Goals
-Short-Term
+### Requirements
 
-File open/save functionality
+* Rust stable
+* GTK4 development libraries installed
 
-Status bar (cursor position, modified indicator)
+### Build
 
-Document state handling (mode + file path)
-
-Medium-Term
-
-Markup mode (Markdown/HTML) with syntax highlighting
-
-Rich text support using GTK text attributes
-
-Auto-reload + autosave options
-
-Preferences window
-
-Long-Term
-
-Plugin architecture (syntax highlighters, format converters)
-
-Multi-tab support
-
-Cross-platform packaging
-
-.deb for Linux
-
-.app bundle for macOS
-
-Installation (Linux)
-System dependencies
-
-GTK4 development libraries:
-
-sudo apt update
-sudo apt install -y libgtk-4-dev
-
-Build
-git clone https://github.com/<yourname>/rpad.git
-cd rpad
+```
 cargo build
+```
 
-Run
-cargo run --
+### Run
 
-Optional global install
-cargo install --path .
-rpad
+```
+cargo run -- [options]
+```
 
-Command Line Usage
-rpad <FILE> [--mode plain|markup|rich]
+## Save Workflow
 
+* If the file is new: Save shows a GTK file chooser, defaults to `Untitled.txt`
+* If already saved: Save writes directly to disk
+* Save As always opens a new chooser
+* Supported formats:
 
-Examples:
+  * `.txt` (default)
+  * `.md`
+  * `.rt` (placeholder for rich-text support)
 
-rpad notes.txt
-rpad index.md --mode markup
-rpad --mode rich
+## Close Confirmation
 
-Development Notes
+The window only closes when:
 
-The UI layer is built with GTK4 using the gtk4 Rust bindings.
+* No unsaved changes, or
+* User selects **Save** or **Don't Save** in the dialog
 
-All GTK actions (File / Mode menu entries) are registered via gio::SimpleAction.
+## Find & Replace
 
-Missing or incomplete actions currently log debug output.
+The editor scans the entire buffer and replaces all matches.
+Future enhancement: scoped replace (selection-only).
 
-The code currently uses a single TextView in a ScrolledWindow, with plans to abstract a Document struct later.
+## Roadmap
 
-To run static analysis:
+* Syntax highlighting for Markdown
+* Basic rich-text mode
+* Preferences dialog
+* Session restore
+* Cross-platform packaging (Flatpak, dmg, exe)
 
-cargo check
+## Development Notes
 
+* Uses `glib::clone!` replacement patterns where needed
+* GTK actions are centralized for menu and shortcuts
+* TextBuffer wrapped with `Rc<RefCell<_>>` for controlled mutability
 
-To apply automatic fixes:
+## License
 
-cargo fix
+MIT (or specify if different)
 
-Platform Roadmap
-Platform	Status	Notes
-Linux (GTK4)	✅ Working	Primary development target
-macOS	🔄 Planned	Requires Homebrew GTK4 + bundle integration
-Windows	❌ Not planned	Focus is Linux/macOS Notepad-like editor
-Project Structure
-src/
- └── main.rs          # CLI, GTK app initialization, menu, text editor
-Cargo.toml
-README.md
+## Contributions
 
+Open to improvements, refactoring, and feature PRs.
 
-Future structure will include:
+```
 
-src/
- ├── app.rs
- ├── ui/
- │    ├── window.rs
- │    ├── menus.rs
- │    └── actions.rs
- └── document/
-      ├── mod.rs
-      ├── plain.rs
-      ├── markup.rs
-      └── rich.rs
+---
 
-License
-
-MIT.
+If you want this README tailored with badges, screenshots, a full architecture diagram, or a contribution guide, type **continue**.
+```
