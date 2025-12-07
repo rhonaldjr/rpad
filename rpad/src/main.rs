@@ -1,19 +1,16 @@
 use std::cell::RefCell;
 use std::fs;
-use std::path::{PathBuf, Path};
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
+use gtk::glib;
+
 use gtk4 as gtk;
-use gtk::prelude::*;
-use gtk::gio;
-use gtk::glib::{self, Propagation};
 
 use sourceview5 as sv;
 use sourceview5::prelude::*;
 
 use std::process::Command;
-
-use gtk::prelude::TextBufferExt;
 
 #[derive(Parser, Debug)]
 #[command(name = "rpad", version, about = "rpad – A simple Rust notepad")]
@@ -58,7 +55,7 @@ struct AppConfig {
 #[derive(Debug)]
 struct DocumentState {
     path: RefCell<Option<PathBuf>>,
-    mode: RefCell<Mode>,           // 🔹 NEW
+    mode: RefCell<Mode>, // 🔹 NEW
     undo_stack: RefCell<Vec<String>>,
     redo_stack: RefCell<Vec<String>>,
     last_text: RefCell<String>,
@@ -66,13 +63,25 @@ struct DocumentState {
     dirty: RefCell<bool>,
     find_text: RefCell<String>,
     match_case: RefCell<bool>,
+    zoom: RefCell<u32>,
+    css_provider: gtk::CssProvider,
+    label_line_col: gtk::Label,
+    label_words_chars: gtk::Label,
+    label_mode: gtk::Label,
+    label_sudo: gtk::Label,
+    status_box: gtk::Box,
+
+    // Sudo Mode
+    sudo_password: RefCell<Option<String>>,
+    sudo_expiry: RefCell<Option<std::time::Instant>>,
 }
 
 impl DocumentState {
-    fn new(initial: Option<PathBuf>, initial_mode: Mode) -> Self {   // 🔹 CHANGED
+    fn new(initial: Option<PathBuf>, initial_mode: Mode) -> Self {
+        // 🔹 CHANGED
         Self {
             path: RefCell::new(initial),
-            mode: RefCell::new(initial_mode),                        // 🔹 NEW
+            mode: RefCell::new(initial_mode), // 🔹 NEW
             undo_stack: RefCell::new(Vec::new()),
             redo_stack: RefCell::new(Vec::new()),
             last_text: RefCell::new(String::new()),
@@ -80,6 +89,27 @@ impl DocumentState {
             dirty: RefCell::new(false),
             find_text: RefCell::new(String::new()),
             match_case: RefCell::new(false),
+            zoom: RefCell::new(100),
+            css_provider: gtk::CssProvider::new(),
+            label_line_col: gtk::Label::new(Some("Ln 1, Col 1")),
+            label_words_chars: gtk::Label::new(Some("0 words, 0 chars")),
+            label_mode: gtk::Label::new(Some(match initial_mode {
+                Mode::Plain => "Plain Text",
+                Mode::Markup => "Markdown",
+            })),
+            label_sudo: {
+                let l = gtk::Label::new(Some("SUDO"));
+                // Style it: bold red
+                let attr_list = gtk::pango::AttrList::new();
+                attr_list.insert(gtk::pango::AttrColor::new_foreground(65535, 0, 0)); // Red
+                attr_list.insert(gtk::pango::AttrInt::new_weight(gtk::pango::Weight::Bold));
+                l.set_attributes(Some(&attr_list));
+                l.set_visible(false); // Hidden by default
+                l
+            },
+            status_box: gtk::Box::new(gtk::Orientation::Horizontal, 12),
+            sudo_password: RefCell::new(None),
+            sudo_expiry: RefCell::new(None),
         }
     }
 
@@ -91,14 +121,16 @@ impl DocumentState {
         self.path.borrow().clone()
     }
 
-    fn mode(&self) -> Mode {                    // 🔹 NEW
+    fn mode(&self) -> Mode {
+        // 🔹 NEW
         *self.mode.borrow()
     }
 
-    fn set_mode(&self, value: Mode) {           // 🔹 NEW
+    fn set_mode(&self, value: Mode) {
+        // 🔹 NEW
         *self.mode.borrow_mut() = value;
     }
-    
+
     fn set_dirty(&self, value: bool) {
         *self.dirty.borrow_mut() = value;
     }
@@ -107,7 +139,6 @@ impl DocumentState {
         *self.dirty.borrow()
     }
 }
-
 
 fn main() {
     // 1. Parse CLI args
@@ -134,7 +165,6 @@ fn main() {
     app.run();
 }
 
-
 fn build_ui(app: &gtk::Application, config: AppConfig) {
     // Window
     let title = match &config.file {
@@ -149,6 +179,18 @@ fn build_ui(app: &gtk::Application, config: AppConfig) {
         .default_height(700)
         .build();
 
+    // Register custom icon
+    if let Some(display) = gtk::gdk::Display::default() {
+        let icon_theme = gtk::IconTheme::for_display(&display);
+        if let Ok(cwd) = std::env::current_dir() {
+            icon_theme.add_search_path(cwd.join("assets"));
+        } else {
+            // Fallback if current_dir fails?
+            icon_theme.add_search_path("assets");
+        }
+    }
+    window.set_icon_name(Some("rpad_icon"));
+
     // Track current file path + mode in window data
     let doc_state = DocumentState::new(config.file.clone(), config.mode);
     unsafe {
@@ -156,13 +198,25 @@ fn build_ui(app: &gtk::Application, config: AppConfig) {
     }
 
     // Main text area using GtkSourceView5
-    let buffer = sv::Buffer::new(None);           // no language yet
-    let text_view = sv::View::with_buffer(&buffer);    
+    let buffer = sv::Buffer::new(None); // no language yet
+    let text_view = sv::View::with_buffer(&buffer);
 
     text_view.set_monospace(true);
     text_view.set_wrap_mode(gtk::WrapMode::WordChar);
 
     apply_language_for_mode(&buffer, config.mode);
+
+    // Apply initial zoom
+    unsafe {
+        if let Some(doc_state_ptr) = window.data::<DocumentState>("rpad-doc-state") {
+            let doc_state: &DocumentState = doc_state_ptr.as_ref();
+            text_view.style_context().add_provider(
+                &doc_state.css_provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+            update_zoom_css(doc_state);
+        }
+    }
 
     // Store the editor view on the window so helpers can find its buffer
     unsafe {
@@ -177,25 +231,39 @@ fn build_ui(app: &gtk::Application, config: AppConfig) {
 
     // Track edits for undo/redo *and* dirty flag
     {
-        let window_clone = window.clone();
-        buffer.connect_changed(move |buf| {
+        let window_clone_1 = window.clone();
+        let window_clone_2 = window.clone();
+        buffer.connect_changed(move |buf| unsafe {
+            if let Some(doc_state_ptr) = window_clone_1.data::<DocumentState>("rpad-doc-state") {
+                let doc_state: &DocumentState = doc_state_ptr.as_ref();
+
+                if *doc_state.is_programmatic.borrow() {
+                    return;
+                }
+
+                let (start, end) = buf.bounds();
+                let text = buf.text(&start, &end, false).to_string();
+
+                let mut last_text = doc_state.last_text.borrow_mut();
+                if text != *last_text {
+                    doc_state.undo_stack.borrow_mut().push(last_text.clone());
+                    doc_state.redo_stack.borrow_mut().clear();
+                    *last_text = text;
+                    doc_state.set_dirty(true);
+                    update_counts(doc_state, buf.upcast_ref());
+                }
+            }
+        });
+
+        // 2) Track cursor movement for Line/Col
+        buffer.connect_mark_set(move |buf, _iter, mark| {
             unsafe {
-                if let Some(doc_state_ptr) = window_clone.data::<DocumentState>("rpad-doc-state") {
+                if let Some(doc_state_ptr) = window_clone_2.data::<DocumentState>("rpad-doc-state")
+                {
                     let doc_state: &DocumentState = doc_state_ptr.as_ref();
-
-                    if *doc_state.is_programmatic.borrow() {
-                        return;
-                    }
-
-                    let (start, end) = buf.bounds();
-                    let text = buf.text(&start, &end, false).to_string();
-
-                    let mut last_text = doc_state.last_text.borrow_mut();
-                    if text != *last_text {
-                        doc_state.undo_stack.borrow_mut().push(last_text.clone());
-                        doc_state.redo_stack.borrow_mut().clear();
-                        *last_text = text;
-                        doc_state.set_dirty(true);
+                    // Only update if "insert" mark moved
+                    if mark.name().as_deref() == Some("insert") {
+                        update_cursor(doc_state, buf.upcast_ref());
                     }
                 }
             }
@@ -216,16 +284,46 @@ fn build_ui(app: &gtk::Application, config: AppConfig) {
     // Menu bar
     let menubar = build_menubar();
 
-    // Main container (vertical: menubar on top, editor below)
+    // Main container (vertical: menubar on top, editor below, status bar bottom)
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     vbox.append(&menubar);
     vbox.append(&scrolled);
 
+    // Status Bar (retrieved from State)
+    if let Some(doc_state_ptr) = unsafe { window.data::<DocumentState>("rpad-doc-state") } {
+        unsafe {
+            let doc_state: &DocumentState = doc_state_ptr.as_ref();
+            let status_box = &doc_state.status_box;
+
+            status_box.set_margin_start(6);
+            status_box.set_margin_end(6);
+            status_box.set_margin_top(2);
+            status_box.set_margin_bottom(2);
+
+            // Add items to status box
+            status_box.append(&doc_state.label_sudo);
+            status_box.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+            status_box.append(&doc_state.label_mode);
+            status_box.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+            status_box.append(&doc_state.label_line_col);
+            status_box.append(&gtk::Box::new(gtk::Orientation::Horizontal, 0)); // spacer
+
+            // Push words/chars to the right
+            let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            spacer.set_hexpand(true);
+            status_box.append(&spacer);
+
+            status_box.append(&doc_state.label_words_chars);
+
+            vbox.append(status_box);
+        }
+    }
+
     window.set_child(Some(&vbox));
 
-        // Ask for confirmation when closing if there are unsaved changes
+    // Ask for confirmation when closing if there are unsaved changes
     {
-        let window_clone = window.clone();
+        let _window_clone = window.clone();
         window.connect_close_request(move |win| {
             unsafe {
                 if let Some(doc_state_ptr) = win.data::<DocumentState>("rpad-doc-state") {
@@ -256,38 +354,35 @@ fn build_ui(app: &gtk::Application, config: AppConfig) {
                         match response {
                             gtk::ResponseType::Accept => {
                                 // Save then close
-                                unsafe {
-                                    if let Some(doc_state_ptr) =
-                                        win_for_dialog.data::<DocumentState>("rpad-doc-state")
-                                    {
-                                        let doc_state: &DocumentState = doc_state_ptr.as_ref();
+                                if let Some(doc_state_ptr) =
+                                    win_for_dialog.data::<DocumentState>("rpad-doc-state")
+                                {
+                                    let doc_state: &DocumentState = doc_state_ptr.as_ref();
 
-                                        if let Some(path) = doc_state.path() {
-                                            // Save to existing path
-                                            if let Err(err) =
-                                                save_buffer_to_path(&win_for_dialog, &path)
-                                            {
-                                                eprintln!("Error saving file: {err}");
-                                            } else {
-                                                win_for_dialog.close();
-                                            }
+                                    if let Some(path) = doc_state.path() {
+                                        // Save to existing path
+                                        if let Err(err) =
+                                            save_buffer_to_path(&win_for_dialog, &path)
+                                        {
+                                            eprintln!("Error saving file: {err}");
                                         } else {
-                                            // No path yet → Save As + close
-                                            save_as_with_dialog_and_then_close(&win_for_dialog);
+                                            win_for_dialog.close();
                                         }
+                                    } else {
+                                        // No path yet → Save As + close
+                                        save_as_with_dialog_and_then_close(&win_for_dialog);
                                     }
                                 }
                             }
                             gtk::ResponseType::Reject => {
                                 // Don't save: mark as clean so close_request won't re-prompt
-                                unsafe {
-                                    if let Some(doc_state_ptr) =
-                                        win_for_dialog.data::<DocumentState>("rpad-doc-state")
-                                    {
-                                        let doc_state: &DocumentState = doc_state_ptr.as_ref();
-                                        doc_state.set_dirty(false);
-                                    }
+                                if let Some(doc_state_ptr) =
+                                    win_for_dialog.data::<DocumentState>("rpad-doc-state")
+                                {
+                                    let doc_state: &DocumentState = doc_state_ptr.as_ref();
+                                    doc_state.set_dirty(false);
                                 }
+
                                 win_for_dialog.close();
                             }
                             _ => {
@@ -331,14 +426,13 @@ fn build_menubar() -> gtk::PopoverMenuBar {
 
     // ----- File menu -----
     let file_menu = gio::Menu::new();
-    file_menu.append(Some("New"),          Some("app.new"));
-    file_menu.append(Some("New Window"),   Some("app.new_window"));
-    file_menu.append(Some("Open…"),        Some("app.open"));
-    file_menu.append(Some("Save"),         Some("app.save"));
-    file_menu.append(Some("Save As…"),     Some("app.save_as"));
-    file_menu.append(Some("Page Setup…"),  Some("app.page_setup"));
-    file_menu.append(Some("Print…"),       Some("app.print"));
-    file_menu.append(Some("Exit"),         Some("app.quit"));
+    file_menu.append(Some("New"), Some("app.new"));
+    file_menu.append(Some("New Window"), Some("app.new_window"));
+    file_menu.append(Some("Open…"), Some("app.open"));
+    file_menu.append(Some("Save"), Some("app.save"));
+    file_menu.append(Some("Save As…"), Some("app.save_as"));
+    file_menu.append(Some("Print…"), Some("app.print"));
+    file_menu.append(Some("Exit"), Some("app.quit"));
     root.append_submenu(Some("File"), &file_menu);
 
     // ----- Edit menu -----
@@ -356,8 +450,8 @@ fn build_menubar() -> gtk::PopoverMenuBar {
     // Group 2: Cut / Copy / Paste / Delete
     //
     let group2 = gio::Menu::new();
-    group2.append(Some("Cut"),   Some("app.cut"));
-    group2.append(Some("Copy"),  Some("app.copy"));
+    group2.append(Some("Cut"), Some("app.cut"));
+    group2.append(Some("Copy"), Some("app.copy"));
     group2.append(Some("Paste"), Some("app.paste"));
     group2.append(Some("Delete"), Some("app.delete"));
     edit_menu.append_section(None, &group2);
@@ -366,11 +460,11 @@ fn build_menubar() -> gtk::PopoverMenuBar {
     // Group 3: Find / Find Next / Find Previous / Replace / Go To
     //
     let group3 = gio::Menu::new();
-    group3.append(Some("Find…"),          Some("app.find"));
-    group3.append(Some("Find Next"),      Some("app.find_next"));
-    group3.append(Some("Find Previous"),  Some("app.find_prev"));
-    group3.append(Some("Replace…"),       Some("app.replace"));
-    group3.append(Some("Go To…"),         Some("app.goto"));
+    group3.append(Some("Find…"), Some("app.find"));
+    group3.append(Some("Find Next"), Some("app.find_next"));
+    group3.append(Some("Find Previous"), Some("app.find_prev"));
+    group3.append(Some("Replace…"), Some("app.replace"));
+    group3.append(Some("Go To…"), Some("app.goto"));
     edit_menu.append_section(None, &group3);
 
     //
@@ -378,7 +472,7 @@ fn build_menubar() -> gtk::PopoverMenuBar {
     //
     let group4 = gio::Menu::new();
     group4.append(Some("Select All"), Some("app.select_all"));
-    group4.append(Some("Time/Date"),  Some("app.time_date"));
+    group4.append(Some("Time/Date"), Some("app.time_date"));
     edit_menu.append_section(None, &group4);
 
     root.append_submenu(Some("Edit"), &edit_menu);
@@ -387,8 +481,8 @@ fn build_menubar() -> gtk::PopoverMenuBar {
     let view_menu = gio::Menu::new();
 
     let zoom_menu = gio::Menu::new();
-    zoom_menu.append(Some("Zoom In"),            Some("app.zoom_in"));
-    zoom_menu.append(Some("Zoom Out"),           Some("app.zoom_out"));
+    zoom_menu.append(Some("Zoom In"), Some("app.zoom_in"));
+    zoom_menu.append(Some("Zoom Out"), Some("app.zoom_out"));
     zoom_menu.append(Some("Restore Default Zoom"), Some("app.zoom_reset"));
 
     view_menu.append_submenu(Some("Zoom"), &zoom_menu);
@@ -397,13 +491,13 @@ fn build_menubar() -> gtk::PopoverMenuBar {
 
     // ----- Mode menu (your custom feature) -----
     let mode_menu = gio::Menu::new();
-    mode_menu.append(Some("Plain Text"), Some("app.mode_plain"));
-    mode_menu.append(Some("Markup"),     Some("app.mode_markup"));
+    mode_menu.append(Some("Plain Text"), Some("app.mode('plain')"));
+    mode_menu.append(Some("Markup"), Some("app.mode('markup')"));
+    mode_menu.append(Some("Sudo Mode"), Some("app.sudo_mode"));
     root.append_submenu(Some("Mode"), &mode_menu);
 
     // ----- Help menu -----
     let help_menu = gio::Menu::new();
-    help_menu.append(Some("View Help"), Some("app.view_help"));
     help_menu.append(Some("About rpad"), Some("app.about"));
     root.append_submenu(Some("Help"), &help_menu);
 
@@ -411,107 +505,111 @@ fn build_menubar() -> gtk::PopoverMenuBar {
 }
 
 fn get_text_buffer_from_window(window: &gtk::ApplicationWindow) -> Option<gtk::TextBuffer> {
-    if let Some(child) = window.child() {
-        if let Ok(box_container) = child.downcast::<gtk::Box>() {
-            // TextView/SourceView is inside ScrolledWindow → inside vbox
-            if let Some(scrolled) = box_container.last_child() {
-                if let Ok(scrolled) = scrolled.downcast::<gtk::ScrolledWindow>() {
-                    if let Some(view_widget) = scrolled.child() {
-                        // Try SourceView5 first
-                        if let Ok(source_view) = view_widget.clone().downcast::<sv::View>() {
-                            return Some(source_view.buffer().upcast::<gtk::TextBuffer>());
-                        }
-
-                        // Fallback: plain TextView
-                        if let Ok(text_view) = view_widget.downcast::<gtk::TextView>() {
-                            return Some(text_view.buffer());
-                        }
-                    }
-                }
-            }
+    unsafe {
+        if let Some(view_ptr) = window.data::<sv::View>("rpad-text-view") {
+            let view: &sv::View = view_ptr.as_ref();
+            return Some(view.buffer().upcast::<gtk::TextBuffer>());
         }
     }
     None
 }
 
-fn buffer_is_empty(buffer: &sv::Buffer) -> bool {
-    // sv::Buffer is a subclass of gtk::TextBuffer and implements TextBufferExt,
-    // so these methods are available directly.
-    let (start, end) = buffer.bounds();
-    buffer.text(&start, &end, false).is_empty()
-}
-
-fn change_mode_if_empty(
-    window: &gtk::ApplicationWindow,
-    text_view: &sv::View,
-    new_mode: Mode,
-) {
-    unsafe {
-        if let Some(doc_state_ptr) = window.data::<DocumentState>("rpad-doc-state") {
-            let doc_state: &DocumentState = doc_state_ptr.as_ref();
-
-            if doc_state.mode() == new_mode {
-                return;
-            }
-
-            let sv_buffer = text_view.buffer();
-
-            if !buffer_is_empty(&sv_buffer) {
-                let dialog = gtk::MessageDialog::builder()
-                    .transient_for(window)
-                    .modal(true)
-                    .message_type(gtk::MessageType::Info)
-                    .buttons(gtk::ButtonsType::Ok)
-                    .text("Cannot change mode while the document has content.")
-                    .secondary_text(
-                        "Create a new file or clear all text before switching between Plain and Markup.",
-                    )
-                    .build();
-
-                dialog.connect_response(|d, _| d.close());
-                dialog.show();
-                return;
-            }
-
-            doc_state.set_mode(new_mode);
-            apply_language_for_mode(&sv_buffer, new_mode);
-
-            let base_title = match doc_state.path() {
-                Some(path) => format!("rpad - {}", path.display()),
-                None => "rpad - Untitled".to_string(),
-            };
-            let suffix = match new_mode {
-                Mode::Plain => " [Plain]",
-                Mode::Markup => " [Markup]",
-            };
-            window.set_title(Some(&format!("{}{}", base_title, suffix)));
-        }
-    }
+fn buffer_is_empty<P: IsA<gtk::TextBuffer>>(buffer: &P) -> bool {
+    let start = buffer.start_iter();
+    let end = buffer.end_iter();
+    buffer.text(&start, &end, true).is_empty()
 }
 
 fn save_buffer_to_path(
     window: &gtk::ApplicationWindow,
-    path: &Path,
-) -> Result<(), std::io::Error> {
-    if let Some(buffer) = get_text_buffer_from_window(window) {
-        let (start, end) = buffer.bounds();
-        let text = buffer.text(&start, &end, false); // GString
-        fs::write(path, text.as_str())?;
-    }
+    path: &std::path::Path,
+) -> Result<(), String> {
+    let buffer = get_text_buffer_from_window(window)
+        .ok_or_else(|| "Could not find text buffer".to_string())?;
+    let (start, end) = buffer.bounds();
+    let text = buffer.text(&start, &end, false);
 
-    // Update window title
-    window.set_title(Some(&format!("rpad - {}", path.display())));
-
-    // Update stored path + mark clean
     unsafe {
         if let Some(doc_state_ptr) = window.data::<DocumentState>("rpad-doc-state") {
             let doc_state: &DocumentState = doc_state_ptr.as_ref();
-            doc_state.set_path(Some(path.to_path_buf()));
-            doc_state.set_dirty(false);   // 🔹 here
+
+            // Check Sudo Mode
+            let mut use_sudo = false;
+            let mut sudo_pass = None;
+
+            if let Some(pass) = doc_state.sudo_password.borrow().clone() {
+                // Check expiry
+                let expired = if let Some(expiry) = *doc_state.sudo_expiry.borrow() {
+                    std::time::Instant::now() > expiry
+                } else {
+                    true
+                };
+
+                if expired {
+                    // Re-prompt
+                    if let Some(new_pass) = prompt_for_password(window) {
+                        if validate_sudo_password(&new_pass) {
+                            *doc_state.sudo_password.borrow_mut() = Some(new_pass.clone());
+                            *doc_state.sudo_expiry.borrow_mut() = Some(
+                                std::time::Instant::now() + std::time::Duration::from_secs(300),
+                            );
+                            use_sudo = true;
+                            sudo_pass = Some(new_pass);
+                        } else {
+                            return Err("Sudo re-authentication failed".to_string());
+                        }
+                    } else {
+                        return Err("Sudo re-authentication cancelled".to_string());
+                    }
+                } else {
+                    use_sudo = true;
+                    sudo_pass = Some(pass);
+                }
+            }
+
+            if use_sudo {
+                if let Some(pass) = sudo_pass {
+                    perform_sudo_save(path, &text, &pass)?;
+                } else {
+                    return Err("Sudo password missing logic error".to_string());
+                }
+            } else {
+                // Normal Save
+                if let Err(e) = fs::write(path, &text) {
+                    return Err(format!("Failed to write file: {}", e));
+                }
+            }
+
+            // Mark as not dirty only on success
+            doc_state.set_dirty(false);
+            *doc_state.last_text.borrow_mut() = text.to_string();
+
+            // Reset title (preserving [SUDO] tag if active)
+            let base_title = format!("rpad - {}", path.display());
+            let suffix = if doc_state.sudo_password.borrow().is_some() {
+                " [SUDO]"
+            } else {
+                ""
+            };
+
+            // Also append mode
+            let mode_suffix = match doc_state.mode() {
+                Mode::Plain => " [Plain]",
+                Mode::Markup => " [Markdown]",
+            };
+
+            window.set_title(Some(&format!("{}{}{}", base_title, suffix, mode_suffix)));
+
+            return Ok(());
         }
     }
 
-    Ok(())
+    // Fallback if doc_state missing (shouldn't happen)
+    if let Err(e) = fs::write(path, text.as_str()) {
+        Err(format!("Failed to write file: {}", e))
+    } else {
+        Ok(())
+    }
 }
 
 fn load_file_into_window(
@@ -536,13 +634,22 @@ fn load_file_into_window(
             *doc_state.last_text.borrow_mut() = contents.clone();
 
             doc_state.set_path(Some(path.to_path_buf()));
-            doc_state.set_dirty(false);   // 🔹 clean
+            doc_state.set_dirty(false);
+            *doc_state.last_text.borrow_mut() = contents.clone();
+
+            // Reset Sudo
+            *doc_state.sudo_password.borrow_mut() = None;
+            *doc_state.sudo_expiry.borrow_mut() = None;
+
+            // Update UI state
+            set_sudo_state(window, false);
+
+            window.set_title(Some(&format!("rpad - {}", path.display())));
 
             *doc_state.is_programmatic.borrow_mut() = false;
         }
     }
 
-    window.set_title(Some(&format!("rpad - {}", path.display())));
     Ok(())
 }
 
@@ -589,15 +696,12 @@ fn open_with_dialog(window: &gtk::ApplicationWindow) {
     dialog.show();
 }
 
-fn register_actions(
-    app: &gtk::Application,
-    window: &gtk::ApplicationWindow,
-    text_view: &sv::View,) {
+fn register_actions(app: &gtk::Application, window: &gtk::ApplicationWindow, text_view: &sv::View) {
     use gtk::gio::SimpleAction;
 
     // ----- File actions -----
 
-     // Quit / Exit: go through window.close() so dirty-check runs
+    // Quit / Exit: go through window.close() so dirty-check runs
     let quit = SimpleAction::new("quit", None);
     let window_for_quit = window.clone();
     quit.connect_activate(move |_, _| {
@@ -608,25 +712,27 @@ fn register_actions(
     // New (clear current document)
     let new_doc = SimpleAction::new("new", None);
     let window_clone = window.clone();
-    new_doc.connect_activate(move |_, _| {
-        window_clone.set_title(Some("rpad - Untitled"));
+    new_doc.connect_activate(move |_, _| unsafe {
+        if let Some(text_buffer) = get_text_buffer_from_window(&window_clone) {
+            text_buffer.set_text("");
 
-        unsafe {
             if let Some(doc_state_ptr) = window_clone.data::<DocumentState>("rpad-doc-state") {
                 let doc_state: &DocumentState = doc_state_ptr.as_ref();
-
-                *doc_state.is_programmatic.borrow_mut() = true;
-
-                if let Some(buffer) = get_text_buffer_from_window(&window_clone) {
-                    buffer.set_text("");
-                }
-
                 doc_state.set_path(None);
+                doc_state.set_dirty(false);
+                *doc_state.last_text.borrow_mut() = String::new();
+                // Reset Sudo
+                *doc_state.sudo_password.borrow_mut() = None;
+                *doc_state.sudo_expiry.borrow_mut() = None;
+
+                // Update UI state
+                set_sudo_state(&window_clone, false);
+
+                window_clone.set_title(Some("rpad - Untitled"));
+
+                // Also clear undo/redo stacks
                 doc_state.undo_stack.borrow_mut().clear();
                 doc_state.redo_stack.borrow_mut().clear();
-                *doc_state.last_text.borrow_mut() = String::new();
-                doc_state.set_dirty(false);   // 🔹 clean new doc
-
                 *doc_state.is_programmatic.borrow_mut() = false;
             }
         }
@@ -670,7 +776,6 @@ fn register_actions(
                 save_as_with_dialog(&window_clone);
             }
         }
-
     });
     app.add_action(&save);
 
@@ -690,18 +795,40 @@ fn register_actions(
     });
     app.add_action(&open);
 
-    // File: Open / Page Setup / Print (still stubs)
-    for (name, label) in [
-        ("page_setup", "Page Setup"),
-        ("print",      "Print"),
-    ] {
-        let action = SimpleAction::new(name, None);
-        let label = label.to_string();
-        action.connect_activate(move |_, _| {
-            eprintln!("{} not implemented yet.", label);
+    // Print
+    let print = SimpleAction::new("print", None);
+    {
+        let window_clone = window.clone();
+        let text_view_clone = text_view.clone();
+        print.connect_activate(move |_, _| {
+            let op = gtk::PrintOperation::new();
+            op.set_job_name("rpad-print-job");
+
+            let compositor = sv::PrintCompositor::from_view(&text_view_clone);
+
+            let compositor_clone = compositor.clone();
+            op.connect_begin_print(move |op, context| {
+                let compositor = compositor_clone.clone();
+                while !compositor.paginate(context) {
+                    // spin loop or rely on internal iterations?
+                    // Documentation suggests paginate() does a chunk of work.
+                    // Usually we need to keep calling it until TRUE.
+                }
+                op.set_n_pages(compositor.n_pages());
+            });
+
+            let compositor_clone = compositor.clone();
+            op.connect_draw_page(move |_op, context, page_nr| {
+                compositor_clone.draw_page(context, page_nr);
+            });
+
+            let res = op.run(gtk::PrintOperationAction::PrintDialog, Some(&window_clone));
+            if let Err(e) = res {
+                eprintln!("Error printing: {}", e);
+            }
         });
-        app.add_action(&action);
     }
+    app.add_action(&print);
 
     // ----- Edit actions (stubs) -----
     // Undo
@@ -776,10 +903,10 @@ fn register_actions(
     {
         let text_view = text_view.clone();
         copy.connect_activate(move |_, _| {
-                text_view.emit_by_name::<()>("copy-clipboard", &[]);
-            });
-        }
-        app.add_action(&copy);
+            text_view.emit_by_name::<()>("copy-clipboard", &[]);
+        });
+    }
+    app.add_action(&copy);
 
     // PASTE
     let paste = SimpleAction::new("paste", None);
@@ -802,12 +929,20 @@ fn register_actions(
     }
     app.add_action(&delete);
 
-
     // Keyboard shortcuts for these
+    app.set_accels_for_action("app.undo", &["<Primary>z"]);
+    app.set_accels_for_action("app.redo", &["<Primary>y"]);
     app.set_accels_for_action("app.cut", &["<Primary>X"]);
     app.set_accels_for_action("app.copy", &["<Primary>C"]);
     app.set_accels_for_action("app.paste", &["<Primary>V"]);
     app.set_accels_for_action("app.delete", &["Delete"]);
+
+    // File shortcuts
+    app.set_accels_for_action("app.new", &["<Primary>n"]);
+    app.set_accels_for_action("app.save", &["<Primary>s"]);
+    app.set_accels_for_action("app.open", &["<Primary>o"]);
+    app.set_accels_for_action("app.save_as", &["<Primary><Shift>s"]);
+    app.set_accels_for_action("app.quit", &["<Primary>q"]);
 
     // ----- Find / Replace / Go To -----
     // Find…
@@ -871,7 +1006,7 @@ fn register_actions(
     app.set_accels_for_action("app.replace", &["<Primary>H"]);
     app.set_accels_for_action("app.goto", &["<Primary>G"]);
 
-        // Select All
+    // Select All
     let select_all = SimpleAction::new("select_all", None);
     {
         let text_view = text_view.clone();
@@ -906,65 +1041,261 @@ fn register_actions(
     }
     app.add_action(&time_date);
 
-
     app.set_accels_for_action("app.select_all", &["<Primary>A"]);
     app.set_accels_for_action("app.time_date", &["F5"]);
 
     // ----- View actions (stubs) -----
-    for (name, label) in [
-        ("zoom_in",    "Zoom In"),
-        ("zoom_out",   "Zoom Out"),
-        ("zoom_reset", "Restore Default Zoom"),
-    ] {
-        let action = SimpleAction::new(name, None);
-        let label = label.to_string();
-        action.connect_activate(move |_, _| {
-            eprintln!("{} not implemented yet.", label);
-        });
-        app.add_action(&action);
-    }
+    // Zoom In
+    let zoom_in = SimpleAction::new("zoom_in", None);
+    let window_clone = window.clone();
+    zoom_in.connect_activate(move |_, _| unsafe {
+        if let Some(doc_state_ptr) = window_clone.data::<DocumentState>("rpad-doc-state") {
+            let doc_state: &DocumentState = doc_state_ptr.as_ref();
+            let current = *doc_state.zoom.borrow();
+            if current < 500 {
+                *doc_state.zoom.borrow_mut() = current + 10;
+                update_zoom_css(doc_state);
+            }
+        }
+    });
+    app.add_action(&zoom_in);
 
-    let status_bar = SimpleAction::new("status_bar", None);
-    status_bar.connect_activate(|_, _| {
-        eprintln!("Status Bar toggle not implemented yet.");
+    // Zoom Out
+    let zoom_out = SimpleAction::new("zoom_out", None);
+    let window_clone = window.clone();
+    zoom_out.connect_activate(move |_, _| unsafe {
+        if let Some(doc_state_ptr) = window_clone.data::<DocumentState>("rpad-doc-state") {
+            let doc_state: &DocumentState = doc_state_ptr.as_ref();
+            let current = *doc_state.zoom.borrow();
+            if current > 20 {
+                *doc_state.zoom.borrow_mut() = current - 10;
+                update_zoom_css(doc_state);
+            }
+        }
+    });
+    app.add_action(&zoom_out);
+
+    // Zoom Reset
+    let zoom_reset = SimpleAction::new("zoom_reset", None);
+    let window_clone = window.clone();
+    zoom_reset.connect_activate(move |_, _| unsafe {
+        if let Some(doc_state_ptr) = window_clone.data::<DocumentState>("rpad-doc-state") {
+            let doc_state: &DocumentState = doc_state_ptr.as_ref();
+            *doc_state.zoom.borrow_mut() = 100;
+            update_zoom_css(doc_state);
+        }
+    });
+    app.add_action(&zoom_reset);
+
+    // Add shortcuts
+    app.set_accels_for_action("app.zoom_in", &["<Primary>plus", "<Primary>equal"]);
+    app.set_accels_for_action("app.zoom_out", &["<Primary>minus"]);
+    app.set_accels_for_action("app.zoom_reset", &["<Primary>0"]);
+
+    let status_bar = SimpleAction::new_stateful(
+        "status_bar",
+        None,
+        &true.to_variant(), // Default to true (visible)
+    );
+    let window_clone = window.clone();
+    status_bar.connect_change_state(move |action, state| unsafe {
+        if let Some(state) = state {
+            action.set_state(state); // Update action state
+            let visible = state.get::<bool>().unwrap_or(true);
+
+            if let Some(doc_state_ptr) = window_clone.data::<DocumentState>("rpad-doc-state") {
+                let doc_state: &DocumentState = doc_state_ptr.as_ref();
+                doc_state.status_box.set_visible(visible);
+            }
+        }
     });
     app.add_action(&status_bar);
 
     // ----- Mode actions -----
-    let mode_plain = SimpleAction::new("mode_plain", None);
+    // ----- Mode actions -----
+    // Stateful "mode" action
+    let initial_mode_str = unsafe {
+        if let Some(doc_state_ptr) = window.data::<DocumentState>("rpad-doc-state") {
+            let doc_state: &DocumentState = doc_state_ptr.as_ref();
+            match doc_state.mode() {
+                Mode::Plain => "plain",
+                Mode::Markup => "markup",
+            }
+        } else {
+            "plain"
+        }
+    };
+
+    let mode_action = SimpleAction::new_stateful(
+        "mode",
+        Some(glib::VariantTy::STRING),
+        &initial_mode_str.to_variant(),
+    );
+
     {
         let window_clone = window.clone();
         let text_view_clone = text_view.clone();
-        mode_plain.connect_activate(move |_, _| {
-            change_mode_if_empty(&window_clone, &text_view_clone, Mode::Plain);
+        mode_action.connect_change_state(move |action, value| unsafe {
+            if let Some(value) = value {
+                let requested_mode_str = value.str().unwrap_or("plain");
+                let requested_mode = match requested_mode_str {
+                    "markup" => Mode::Markup,
+                    _ => Mode::Plain,
+                };
+
+                if let Some(doc_state_ptr) = window_clone.data::<DocumentState>("rpad-doc-state") {
+                    let doc_state: &DocumentState = doc_state_ptr.as_ref();
+
+                    // If already in that mode, just ensure state is sync and return
+                    if doc_state.mode() == requested_mode {
+                        action.set_state(value);
+                        return;
+                    }
+
+                    // Check buffer
+                    let sv_buffer = text_view_clone
+                        .buffer()
+                        .downcast::<sv::Buffer>()
+                        .expect("Buffer is not sv::Buffer");
+
+                    if !buffer_is_empty(&sv_buffer) {
+                        // Show dialog
+                        let dialog = gtk::MessageDialog::builder()
+                            .transient_for(&window_clone)
+                            .modal(true)
+                            .message_type(gtk::MessageType::Info)
+                            .buttons(gtk::ButtonsType::Ok)
+                            .text("Cannot change mode while the document has content.")
+                            .secondary_text(
+                                "Create a new file or clear all text before switching between Plain and Markup.",
+                            )
+                            .build();
+
+                        dialog.connect_response(|d, _| d.close());
+                        dialog.show();
+                        return; // Abort state change
+                    }
+
+                    // Apply changes
+                    doc_state.set_mode(requested_mode);
+
+                    // Update label
+                    let label = match requested_mode {
+                        Mode::Plain => "Plain Text",
+                        Mode::Markup => "Markdown",
+                    };
+                    doc_state.label_mode.set_text(label);
+
+                    // Apply language
+                    apply_language_for_mode(&sv_buffer, requested_mode);
+
+                    // Update title
+                    let base_title = match doc_state.path() {
+                        Some(path) => format!("rpad - {}", path.display()),
+                        None => "rpad - Untitled".to_string(),
+                    };
+                    let suffix = match requested_mode {
+                        Mode::Plain => " [Plain]",
+                        Mode::Markup => " [Markdown]",
+                    };
+                    window_clone.set_title(Some(&format!("{}{}", base_title, suffix)));
+
+                    // Update action state
+                    action.set_state(value);
+                }
+            }
         });
     }
-    app.add_action(&mode_plain);
+    app.add_action(&mode_action);
 
-    let mode_markup = SimpleAction::new("mode_markup", None);
+    // Sudo Mode Toggle
+    let sudo_mode = SimpleAction::new_stateful("sudo_mode", None, &false.to_variant());
     {
         let window_clone = window.clone();
-        let text_view_clone = text_view.clone();
-        mode_markup.connect_activate(move |_, _| {
-            change_mode_if_empty(&window_clone, &text_view_clone, Mode::Markup);
+        sudo_mode.connect_change_state(move |action, value| unsafe {
+            // "value" is the requested new state (Some(bool))
+            if let Some(requested_state_variant) = value {
+                let new_state = requested_state_variant.get::<bool>().unwrap_or(false);
+
+                if let Some(doc_state_ptr) = window_clone.data::<DocumentState>("rpad-doc-state") {
+                    let doc_state: &DocumentState = doc_state_ptr.as_ref();
+
+                    if new_state {
+                        // Enable
+                        if let Some(password) = prompt_for_password(&window_clone) {
+                            if validate_sudo_password(&password) {
+                                *doc_state.sudo_password.borrow_mut() = Some(password);
+                                *doc_state.sudo_expiry.borrow_mut() = Some(
+                                    std::time::Instant::now() + std::time::Duration::from_secs(300),
+                                );
+
+                                // Success: apply state
+                                action.set_state(&new_state.into());
+
+                                // Update UI manually (or let set_sudo_state do it, but we already set action state above)
+                                // set_sudo_state does: Title, Label, Action State.
+                                // We can just call set_sudo_state(&window_clone, true);
+                                // BUT set_sudo_state sets action state too. It's safe if it checks value,
+                                // but simpler to just do UI updates here or call a UI-only helper.
+                                // Let's use set_sudo_state but rely on its check (it won't hurt to set state again to same value).
+                                set_sudo_state(&window_clone, true);
+                            } else {
+                                // Invalid password: do NOT set state.
+                                // Menu item remains unchecked (reverts).
+                                let dialog = gtk::MessageDialog::builder()
+                                    .transient_for(&window_clone)
+                                    .modal(true)
+                                    .message_type(gtk::MessageType::Error)
+                                    .buttons(gtk::ButtonsType::Ok)
+                                    .text("Invalid Password")
+                                    .build();
+                                dialog.connect_response(|d, _| d.close());
+                                dialog.show();
+                            }
+                        }
+                        // If cancelled, do nothing (state remains false)
+                    } else {
+                        // Disable (unchecked)
+                        *doc_state.sudo_password.borrow_mut() = None;
+                        *doc_state.sudo_expiry.borrow_mut() = None;
+
+                        action.set_state(&new_state.into());
+                        set_sudo_state(&window_clone, false);
+
+                        let dialog = gtk::MessageDialog::builder()
+                            .transient_for(&window_clone)
+                            .modal(true)
+                            .message_type(gtk::MessageType::Info)
+                            .buttons(gtk::ButtonsType::Ok)
+                            .text("Sudo Mode Disabled")
+                            .build();
+                        dialog.connect_response(|d, _| d.close());
+                        dialog.show();
+                    }
+                }
+            }
         });
     }
-    app.add_action(&mode_markup);
+    app.add_action(&sudo_mode);
 
-    // ----- Help actions (stubs) -----
-    let view_help = SimpleAction::new("view_help", None);
-    view_help.connect_activate(|_, _| {
-        eprintln!("View Help not implemented yet.");
-    });
-    app.add_action(&view_help);
-
+    // ----- Help actions -----
     let about = SimpleAction::new("about", None);
-    about.connect_activate(|_, _| {
-        eprintln!("About dialog not implemented yet.");
+    let window_clone = window.clone();
+    about.connect_activate(move |_, _| {
+        let dialog = gtk::AboutDialog::builder()
+            .transient_for(&window_clone)
+            .modal(true)
+            .program_name("Rust Pad (rpad)")
+            .version("0.1.0")
+            .authors(vec!["Rhonald John Rose".to_string()])
+            .website("https://github.com/rhonaldjr/rpad")
+            .logo_icon_name("text-editor") // Use a generic icon name
+            .build();
+
+        dialog.present();
     });
     app.add_action(&about);
 }
-
 
 fn save_as_with_dialog(window: &gtk::ApplicationWindow) {
     use gtk::{FileChooserAction, FileFilter, ResponseType};
@@ -1029,6 +1360,165 @@ fn current_mode(window: &gtk::ApplicationWindow) -> Mode {
             doc_state.mode()
         } else {
             Mode::Plain
+        }
+    }
+}
+
+// Sudo Helpers
+
+fn prompt_for_password(window: &gtk::ApplicationWindow) -> Option<String> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let dialog = gtk::MessageDialog::builder()
+        .transient_for(window)
+        .modal(true)
+        .message_type(gtk::MessageType::Question)
+        .buttons(gtk::ButtonsType::OkCancel)
+        .text("Enter Sudo Password")
+        .build();
+
+    let content_area = dialog.content_area();
+    let entry = gtk::PasswordEntry::new();
+    entry.set_hexpand(true);
+    entry.set_margin_start(10);
+    entry.set_margin_end(10);
+
+    // Modern clone usage
+    let dialog_weak = dialog.downgrade();
+    entry.connect_activate(move |_| {
+        if let Some(dialog) = dialog_weak.upgrade() {
+            dialog.response(gtk::ResponseType::Ok);
+        }
+    });
+
+    content_area.append(&entry);
+    entry.grab_focus();
+    dialog.show();
+
+    // Block until response using iteration loop
+    let response = Rc::new(RefCell::new(None));
+    let response_clone = response.clone();
+    dialog.connect_response(move |d, res| {
+        *response_clone.borrow_mut() = Some(res);
+        d.close();
+    });
+
+    let context = glib::MainContext::default();
+    while response.borrow().is_none() {
+        context.iteration(true);
+    }
+
+    if *response.borrow() == Some(gtk::ResponseType::Ok) {
+        let text = entry.text();
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    None
+}
+
+fn validate_sudo_password(password: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    // sudo -S -v reads password from stdin and validates/updates timestamp
+    let child = Command::new("sudo")
+        .arg("-S")
+        .arg("-v")
+        .arg("-k") // -k ignores cached credentials, forcing validation of the provided password
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    match child {
+        Ok(mut child) => {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(format!("{}\n", password).as_bytes());
+            }
+            match child.wait() {
+                Ok(status) => status.success(),
+                Err(_) => false,
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+fn perform_sudo_save(path: &Path, content: &str, password: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    // 1. Write to temp file
+    let temp_dir = std::env::temp_dir();
+    let temp_file = temp_dir.join("rpad_sudo_save.tmp");
+    if let Err(e) = fs::write(&temp_file, content) {
+        return Err(format!("Failed to write temp file: {}", e));
+    }
+
+    let status = Command::new("sudo")
+        .arg("-S")
+        .arg("cp")
+        .arg(&temp_file)
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped()) // Capture error if any
+        .spawn();
+
+    match status {
+        Ok(mut child) => {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(format!("{}\n", password).as_bytes());
+            }
+            match child.wait() {
+                Ok(status) => {
+                    let _ = fs::remove_file(temp_file);
+                    if status.success() {
+                        Ok(())
+                    } else {
+                        Err("Sudo save failed".to_string())
+                    }
+                }
+                Err(e) => Err(format!("Failed to wait on sudo: {}", e)),
+            }
+        }
+        Err(e) => Err(format!("Failed to spawn sudo: {}", e)),
+    }
+}
+
+fn set_sudo_state(window: &gtk::ApplicationWindow, active: bool) {
+    use gtk::gio;
+
+    unsafe {
+        if let Some(doc_state_ptr) = window.data::<DocumentState>("rpad-doc-state") {
+            let doc_state: &DocumentState = doc_state_ptr.as_ref();
+
+            // Update Title
+            let base_title = match doc_state.path() {
+                Some(path) => format!("rpad - {}", path.display()),
+                None => "rpad - Untitled".to_string(),
+            };
+
+            let suffix = if active { " [SUDO]" } else { "" };
+            let mode_suffix = match doc_state.mode() {
+                Mode::Plain => " [Plain]",
+                Mode::Markup => " [Markdown]",
+            };
+            window.set_title(Some(&format!("{}{}{}", base_title, suffix, mode_suffix)));
+
+            // Update Status Label
+            doc_state.label_sudo.set_visible(active);
+
+            // Update Action State
+            if let Some(app) = window.application() {
+                if let Some(action) = app.lookup_action("sudo_mode") {
+                    if let Some(stateful_action) = action.downcast_ref::<gio::SimpleAction>() {
+                        stateful_action.set_state(&active.into());
+                    }
+                }
+            }
         }
     }
 }
@@ -1109,17 +1599,6 @@ fn apply_language_for_mode(buffer: &sv::Buffer, mode: Mode) {
     }
 }
 
-fn get_source_buffer_from_window(window: &gtk::ApplicationWindow) -> Option<sv::Buffer> {
-    unsafe {
-        if let Some(view_ptr) = window.data::<sv::View>("rpad-text-view") {
-            let view: &sv::View = view_ptr.as_ref();
-            Some(view.buffer()) // sv::Buffer, matches Option<sv::Buffer>
-        } else {
-            None
-        }
-    }
-}
-
 fn search_in_buffer(
     buffer: &sv::Buffer,
     text_view: &sv::View,
@@ -1137,23 +1616,21 @@ fn search_in_buffer(
     }
 
     let insert_mark = buffer.get_insert();
-    let mut iter = buffer.iter_at_mark(&insert_mark);
+    let iter = buffer.iter_at_mark(&insert_mark);
 
     let result = if forward {
-        iter.forward_search(pattern, flags, None)
-            .or_else(|| {
-                let mut start = buffer.start_iter();
-                start.forward_search(pattern, flags, None)
-            })
+        iter.forward_search(pattern, flags, None).or_else(|| {
+            let start = buffer.start_iter();
+            start.forward_search(pattern, flags, None)
+        })
     } else {
-        iter.backward_search(pattern, flags, None)
-            .or_else(|| {
-                let mut end = buffer.end_iter();
-                end.backward_search(pattern, flags, None)
-            })
+        iter.backward_search(pattern, flags, None).or_else(|| {
+            let end = buffer.end_iter();
+            end.backward_search(pattern, flags, None)
+        })
     };
 
-    if let Some((mut match_start, mut match_end)) = result {
+    if let Some((mut match_start, match_end)) = result {
         buffer.select_range(&match_start, &match_end);
         text_view.scroll_to_iter(&mut match_start, 0.1, false, 0.0, 0.0);
         Some((match_start, match_end))
@@ -1171,7 +1648,10 @@ fn do_find_next(window: &gtk::ApplicationWindow, text_view: &sv::View) {
                 return;
             }
             let match_case = *doc_state.match_case.borrow();
-            let buffer = text_view.buffer(); // sv::Buffer
+            let buffer = text_view
+                .buffer()
+                .downcast::<sv::Buffer>()
+                .expect("Buffer is not sv::Buffer");
             let _ = search_in_buffer(&buffer, text_view, &pattern, true, match_case);
         }
     }
@@ -1186,7 +1666,10 @@ fn do_find_prev(window: &gtk::ApplicationWindow, text_view: &sv::View) {
                 return;
             }
             let match_case = *doc_state.match_case.borrow();
-            let buffer = text_view.buffer(); // sv::Buffer
+            let buffer = text_view
+                .buffer()
+                .downcast::<sv::Buffer>()
+                .expect("Buffer is not sv::Buffer");
             let _ = search_in_buffer(&buffer, text_view, &pattern, false, match_case);
         }
     }
@@ -1247,7 +1730,10 @@ fn open_find_dialog(window: &gtk::ApplicationWindow, text_view: &sv::View) {
                 }
             }
 
-            let buffer = text_view_clone.buffer(); // sv::Buffer
+            let buffer = text_view_clone
+                .buffer()
+                .downcast::<sv::Buffer>()
+                .expect("Buffer is not sv::Buffer");
             let _ = search_in_buffer(&buffer, &text_view_clone, &text, true, match_case);
         }
         dialog.close();
@@ -1255,7 +1741,6 @@ fn open_find_dialog(window: &gtk::ApplicationWindow, text_view: &sv::View) {
 
     dialog.show();
 }
-
 
 fn open_replace_dialog(window: &gtk::ApplicationWindow, text_view: &sv::View) {
     let dialog = gtk::Dialog::builder()
@@ -1324,7 +1809,10 @@ fn open_replace_dialog(window: &gtk::ApplicationWindow, text_view: &sv::View) {
                 }
             }
 
-            let buffer = text_view_clone.buffer(); // sv::Buffer
+            let buffer = text_view_clone
+                .buffer()
+                .downcast::<sv::Buffer>()
+                .expect("Buffer is not sv::Buffer");
 
             if let Some((mut start, mut end)) =
                 search_in_buffer(&buffer, &text_view_clone, &find_text, true, match_case)
@@ -1399,4 +1887,33 @@ fn open_goto_dialog(window: &gtk::ApplicationWindow, text_view: &sv::View) {
     });
 
     dialog.show();
+}
+
+fn update_zoom_css(doc_state: &DocumentState) {
+    let zoom = *doc_state.zoom.borrow();
+    let css = format!("textview {{ font-size: {}%; }}", zoom);
+    doc_state.css_provider.load_from_data(&css);
+}
+
+fn update_counts(doc_state: &DocumentState, buffer: &gtk::TextBuffer) {
+    let (start, end) = buffer.bounds();
+    let text = buffer.text(&start, &end, false);
+
+    let char_count = text.chars().count();
+    let word_count = text.split_whitespace().count();
+
+    doc_state
+        .label_words_chars
+        .set_text(&format!("{} words, {} chars", word_count, char_count));
+}
+
+fn update_cursor(doc_state: &DocumentState, buffer: &gtk::TextBuffer) {
+    let insert = buffer.get_insert();
+    let iter = buffer.iter_at_mark(&insert);
+    let line = iter.line() + 1;
+    let col = iter.line_offset() + 1;
+
+    doc_state
+        .label_line_col
+        .set_text(&format!("Ln {}, Col {}", line, col));
 }

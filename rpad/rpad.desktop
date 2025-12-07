@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Rust Pad
+Comment=A simple text editor written in Rust
+Exec=rpad %F
+Icon=rpad_icon
+Terminal=false
+Type=Application
+Categories=Utility;TextEditor;
+Keywords=text;editor;rust;
+MimeType=text/plain;text/markdown;
+StartupNotify=true

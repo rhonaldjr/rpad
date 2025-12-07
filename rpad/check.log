@@ -1,0 +1,195 @@
+    Checking rpad v0.1.0 (/disks/internal1/development/rpad/rpad)
+warning: unused import: `gtk::gio`
+ --> src/main.rs:6:5
+  |
+6 | use gtk::gio;
+  |     ^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `Propagation`
+ --> src/main.rs:7:23
+  |
+7 | use gtk::glib::{self, Propagation};
+  |                       ^^^^^^^^^^^
+
+warning: unused import: `gtk::prelude::*`
+ --> src/main.rs:8:5
+  |
+8 | use gtk::prelude::*;
+  |     ^^^^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+    --> src/main.rs:471:37
+     |
+ 471 |             apply_language_for_mode(&sv_buffer, new_mode);
+     |             ----------------------- ^^^^^^^^^^ expected `&Buffer`, found `&TextBuffer`
+     |             |
+     |             arguments to this function are incorrect
+     |
+     = note: expected reference `&Buffer`
+                found reference `&TextBuffer`
+note: function defined here
+    --> src/main.rs:1076:4
+     |
+1076 | fn apply_language_for_mode(buffer: &sv::Buffer, mode: Mode) {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^ -------------------
+
+error[E0308]: mismatched types
+    --> src/main.rs:1097:18
+     |
+1097 |             Some(view.buffer()) // sv::Buffer, matches Option<sv::Buffer>
+     |             ---- ^^^^^^^^^^^^^ expected `Buffer`, found `TextBuffer`
+     |             |
+     |             arguments to this enum variant are incorrect
+     |
+help: the type constructed contains `TextBuffer` due to the type of the argument passed
+    --> src/main.rs:1097:13
+     |
+1097 |             Some(view.buffer()) // sv::Buffer, matches Option<sv::Buffer>
+     |             ^^^^^-------------^
+     |                  |
+     |                  this argument influences the type of `Some`
+note: tuple variant defined here
+    --> /home/rhonaldjr/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/option.rs:602:5
+     |
+ 602 |     Some(#[stable(feature = "rust1", since = "1.0.0")] T),
+     |     ^^^^
+
+error[E0308]: mismatched types
+    --> src/main.rs:1154:38
+     |
+1154 |             let _ = search_in_buffer(&buffer, text_view, &pattern, true, match_case);
+     |                     ---------------- ^^^^^^^ expected `&Buffer`, found `&TextBuffer`
+     |                     |
+     |                     arguments to this function are incorrect
+     |
+     = note: expected reference `&Buffer`
+                found reference `&TextBuffer`
+note: function defined here
+    --> src/main.rs:1104:4
+     |
+1104 | fn search_in_buffer(
+     |    ^^^^^^^^^^^^^^^^
+1105 |     buffer: &sv::Buffer,
+     |     -------------------
+
+error[E0308]: mismatched types
+    --> src/main.rs:1169:38
+     |
+1169 |             let _ = search_in_buffer(&buffer, text_view, &pattern, false, match_case);
+     |                     ---------------- ^^^^^^^ expected `&Buffer`, found `&TextBuffer`
+     |                     |
+     |                     arguments to this function are incorrect
+     |
+     = note: expected reference `&Buffer`
+                found reference `&TextBuffer`
+note: function defined here
+    --> src/main.rs:1104:4
+     |
+1104 | fn search_in_buffer(
+     |    ^^^^^^^^^^^^^^^^
+1105 |     buffer: &sv::Buffer,
+     |     -------------------
+
+error[E0308]: mismatched types
+    --> src/main.rs:1230:38
+     |
+1230 |             let _ = search_in_buffer(&buffer, &text_view_clone, &text, true, match_case);
+     |                     ---------------- ^^^^^^^ expected `&Buffer`, found `&TextBuffer`
+     |                     |
+     |                     arguments to this function are incorrect
+     |
+     = note: expected reference `&Buffer`
+                found reference `&TextBuffer`
+note: function defined here
+    --> src/main.rs:1104:4
+     |
+1104 | fn search_in_buffer(
+     |    ^^^^^^^^^^^^^^^^
+1105 |     buffer: &sv::Buffer,
+     |     -------------------
+
+error[E0308]: mismatched types
+    --> src/main.rs:1308:34
+     |
+1308 |                 search_in_buffer(&buffer, &text_view_clone, &find_text, true, match_case)
+     |                 ---------------- ^^^^^^^ expected `&Buffer`, found `&TextBuffer`
+     |                 |
+     |                 arguments to this function are incorrect
+     |
+     = note: expected reference `&Buffer`
+                found reference `&TextBuffer`
+note: function defined here
+    --> src/main.rs:1104:4
+     |
+1104 | fn search_in_buffer(
+     |    ^^^^^^^^^^^^^^^^
+1105 |     buffer: &sv::Buffer,
+     |     -------------------
+
+warning: unused variable: `window_clone`
+   --> src/main.rs:227:13
+    |
+227 |         let window_clone = window.clone();
+    |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_window_clone`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+   --> src/main.rs:258:33
+    |
+229 |             unsafe {
+    |             ------ because it's nested under this `unsafe` block
+...
+258 |                                 unsafe {
+    |                                 ^^^^^^ unnecessary `unsafe` block
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+   --> src/main.rs:282:33
+    |
+229 |             unsafe {
+    |             ------ because it's nested under this `unsafe` block
+...
+282 |                                 unsafe {
+    |                                 ^^^^^^ unnecessary `unsafe` block
+
+warning: variable does not need to be mutable
+    --> src/main.rs:1125:17
+     |
+1125 |             let mut start = buffer.start_iter();
+     |                 ----^^^^^
+     |                 |
+     |                 help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> src/main.rs:1130:17
+     |
+1130 |             let mut end = buffer.end_iter();
+     |                 ----^^^
+     |                 |
+     |                 help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> src/main.rs:1121:9
+     |
+1121 |     let mut iter = buffer.iter_at_mark(&insert_mark);
+     |         ----^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> src/main.rs:1135:35
+     |
+1135 |     if let Some((mut match_start, mut match_end)) = result {
+     |                                   ----^^^^^^^^^
+     |                                   |
+     |                                   help: remove this `mut`
+
+For more information about this error, try `rustc --explain E0308`.
+warning: `rpad` (bin "rpad") generated 10 warnings
+error: could not compile `rpad` (bin "rpad") due to 6 previous errors; 10 warnings emitted
