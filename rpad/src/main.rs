@@ -6,9 +6,14 @@ use clap::{Parser, ValueEnum};
 use gtk4 as gtk;
 use gtk::prelude::*;
 use gtk::gio;
-use gtk::glib::{self, Propagation, clone};
+use gtk::glib::{self, Propagation};
+
+use sourceview5 as sv;
+use sourceview5::prelude::*;
 
 use std::process::Command;
+
+use gtk::prelude::TextBufferExt;
 
 #[derive(Parser, Debug)]
 #[command(name = "rpad", version, about = "rpad – A simple Rust notepad")]
@@ -26,14 +31,12 @@ struct Args {
 enum ModeArg {
     Plain,
     Markup,
-    Rich,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Plain,
     Markup,
-    Rich,
 }
 
 impl From<ModeArg> for Mode {
@@ -41,7 +44,6 @@ impl From<ModeArg> for Mode {
         match m {
             ModeArg::Plain => Mode::Plain,
             ModeArg::Markup => Mode::Markup,
-            ModeArg::Rich => Mode::Rich,
         }
     }
 }
@@ -56,24 +58,26 @@ struct AppConfig {
 #[derive(Debug)]
 struct DocumentState {
     path: RefCell<Option<PathBuf>>,
+    mode: RefCell<Mode>,           // 🔹 NEW
     undo_stack: RefCell<Vec<String>>,
     redo_stack: RefCell<Vec<String>>,
     last_text: RefCell<String>,
     is_programmatic: RefCell<bool>,
-    dirty: RefCell<bool>,           // 🔹 NEW
-    find_text: RefCell<String>,   // 🔍 last search text
-    match_case: RefCell<bool>,    // 🔍 match case flag
+    dirty: RefCell<bool>,
+    find_text: RefCell<String>,
+    match_case: RefCell<bool>,
 }
 
 impl DocumentState {
-    fn new(initial: Option<PathBuf>) -> Self {
+    fn new(initial: Option<PathBuf>, initial_mode: Mode) -> Self {   // 🔹 CHANGED
         Self {
             path: RefCell::new(initial),
+            mode: RefCell::new(initial_mode),                        // 🔹 NEW
             undo_stack: RefCell::new(Vec::new()),
             redo_stack: RefCell::new(Vec::new()),
             last_text: RefCell::new(String::new()),
             is_programmatic: RefCell::new(false),
-            dirty: RefCell::new(false),   // 🔹 NEW
+            dirty: RefCell::new(false),
             find_text: RefCell::new(String::new()),
             match_case: RefCell::new(false),
         }
@@ -86,23 +90,32 @@ impl DocumentState {
     fn path(&self) -> Option<PathBuf> {
         self.path.borrow().clone()
     }
+
+    fn mode(&self) -> Mode {                    // 🔹 NEW
+        *self.mode.borrow()
+    }
+
+    fn set_mode(&self, value: Mode) {           // 🔹 NEW
+        *self.mode.borrow_mut() = value;
+    }
     
-    // 🔹 NEW
     fn set_dirty(&self, value: bool) {
         *self.dirty.borrow_mut() = value;
     }
 
-    // 🔹 NEW
     fn is_dirty(&self) -> bool {
         *self.dirty.borrow()
     }
 }
 
+
 fn main() {
     // 1. Parse CLI args
     let args = Args::parse();
+    let initial_mode: Mode = args.mode.into();
+
     let config = AppConfig {
-        mode: args.mode.into(),
+        mode: initial_mode,
         file: args.file,
     };
 
@@ -121,6 +134,7 @@ fn main() {
     app.run();
 }
 
+
 fn build_ui(app: &gtk::Application, config: AppConfig) {
     // Window
     let title = match &config.file {
@@ -135,25 +149,33 @@ fn build_ui(app: &gtk::Application, config: AppConfig) {
         .default_height(700)
         .build();
 
-    // Track current file path in window data
-    let doc_state = DocumentState::new(config.file.clone());
+    // Track current file path + mode in window data
+    let doc_state = DocumentState::new(config.file.clone(), config.mode);
     unsafe {
         window.set_data("rpad-doc-state", doc_state);
     }
 
-    // Main text area (plain text for now)
-    let text_view = gtk::TextView::new();
+    // Main text area using GtkSourceView5
+    let buffer = sv::Buffer::new(None);           // no language yet
+    let text_view = sv::View::with_buffer(&buffer);    
+
     text_view.set_monospace(true);
     text_view.set_wrap_mode(gtk::WrapMode::WordChar);
 
-    // 🔹 Add padding inside the editor
+    apply_language_for_mode(&buffer, config.mode);
+
+    // Store the editor view on the window so helpers can find its buffer
+    unsafe {
+        window.set_data("rpad-text-view", text_view.clone());
+    }
+
+    // Padding inside the editor
     text_view.set_left_margin(12);
     text_view.set_right_margin(12);
     text_view.set_top_margin(8);
     text_view.set_bottom_margin(8);
 
-    // 🔹 Track edits for undo/redo *and* dirty flag
-    let buffer = text_view.buffer();
+    // Track edits for undo/redo *and* dirty flag
     {
         let window_clone = window.clone();
         buffer.connect_changed(move |buf| {
@@ -161,7 +183,6 @@ fn build_ui(app: &gtk::Application, config: AppConfig) {
                 if let Some(doc_state_ptr) = window_clone.data::<DocumentState>("rpad-doc-state") {
                     let doc_state: &DocumentState = doc_state_ptr.as_ref();
 
-                    // Skip changes we make programmatically (Open, Undo, Redo, New)
                     if *doc_state.is_programmatic.borrow() {
                         return;
                     }
@@ -171,14 +192,9 @@ fn build_ui(app: &gtk::Application, config: AppConfig) {
 
                     let mut last_text = doc_state.last_text.borrow_mut();
                     if text != *last_text {
-                        // push previous content into undo stack
                         doc_state.undo_stack.borrow_mut().push(last_text.clone());
-                        // clear redo stack on new edit
                         doc_state.redo_stack.borrow_mut().clear();
-                        // update last_text
                         *last_text = text;
-
-                        // mark document dirty
                         doc_state.set_dirty(true);
                     }
                 }
@@ -197,10 +213,10 @@ fn build_ui(app: &gtk::Application, config: AppConfig) {
     scrolled.set_margin_start(4);
     scrolled.set_margin_end(4);
 
-    // Menu bar stub (File + Mode)
+    // Menu bar
     let menubar = build_menubar();
 
-    // Pack menu + editor vertically
+    // Main container (vertical: menubar on top, editor below)
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     vbox.append(&menubar);
     vbox.append(&scrolled);
@@ -367,12 +383,6 @@ fn build_menubar() -> gtk::PopoverMenuBar {
 
     root.append_submenu(Some("Edit"), &edit_menu);
 
-    // ----- Format menu -----
-    let format_menu = gio::Menu::new();
-    format_menu.append(Some("Word Wrap"), Some("app.word_wrap"));
-    format_menu.append(Some("Font…"),     Some("app.font"));
-    root.append_submenu(Some("Format"), &format_menu);
-
     // ----- View menu -----
     let view_menu = gio::Menu::new();
 
@@ -389,7 +399,6 @@ fn build_menubar() -> gtk::PopoverMenuBar {
     let mode_menu = gio::Menu::new();
     mode_menu.append(Some("Plain Text"), Some("app.mode_plain"));
     mode_menu.append(Some("Markup"),     Some("app.mode_markup"));
-    mode_menu.append(Some("Rich Text"),  Some("app.mode_rich"));
     root.append_submenu(Some("Mode"), &mode_menu);
 
     // ----- Help menu -----
@@ -404,11 +413,17 @@ fn build_menubar() -> gtk::PopoverMenuBar {
 fn get_text_buffer_from_window(window: &gtk::ApplicationWindow) -> Option<gtk::TextBuffer> {
     if let Some(child) = window.child() {
         if let Ok(box_container) = child.downcast::<gtk::Box>() {
-            // TextView is inside ScrolledWindow → inside vbox
+            // TextView/SourceView is inside ScrolledWindow → inside vbox
             if let Some(scrolled) = box_container.last_child() {
                 if let Ok(scrolled) = scrolled.downcast::<gtk::ScrolledWindow>() {
-                    if let Some(text_view) = scrolled.child() {
-                        if let Ok(text_view) = text_view.downcast::<gtk::TextView>() {
+                    if let Some(view_widget) = scrolled.child() {
+                        // Try SourceView5 first
+                        if let Ok(source_view) = view_widget.clone().downcast::<sv::View>() {
+                            return Some(source_view.buffer().upcast::<gtk::TextBuffer>());
+                        }
+
+                        // Fallback: plain TextView
+                        if let Ok(text_view) = view_widget.downcast::<gtk::TextView>() {
                             return Some(text_view.buffer());
                         }
                     }
@@ -417,6 +432,61 @@ fn get_text_buffer_from_window(window: &gtk::ApplicationWindow) -> Option<gtk::T
         }
     }
     None
+}
+
+fn buffer_is_empty(buffer: &sv::Buffer) -> bool {
+    // sv::Buffer is a subclass of gtk::TextBuffer and implements TextBufferExt,
+    // so these methods are available directly.
+    let (start, end) = buffer.bounds();
+    buffer.text(&start, &end, false).is_empty()
+}
+
+fn change_mode_if_empty(
+    window: &gtk::ApplicationWindow,
+    text_view: &sv::View,
+    new_mode: Mode,
+) {
+    unsafe {
+        if let Some(doc_state_ptr) = window.data::<DocumentState>("rpad-doc-state") {
+            let doc_state: &DocumentState = doc_state_ptr.as_ref();
+
+            if doc_state.mode() == new_mode {
+                return;
+            }
+
+            let sv_buffer = text_view.buffer();
+
+            if !buffer_is_empty(&sv_buffer) {
+                let dialog = gtk::MessageDialog::builder()
+                    .transient_for(window)
+                    .modal(true)
+                    .message_type(gtk::MessageType::Info)
+                    .buttons(gtk::ButtonsType::Ok)
+                    .text("Cannot change mode while the document has content.")
+                    .secondary_text(
+                        "Create a new file or clear all text before switching between Plain and Markup.",
+                    )
+                    .build();
+
+                dialog.connect_response(|d, _| d.close());
+                dialog.show();
+                return;
+            }
+
+            doc_state.set_mode(new_mode);
+            apply_language_for_mode(&sv_buffer, new_mode);
+
+            let base_title = match doc_state.path() {
+                Some(path) => format!("rpad - {}", path.display()),
+                None => "rpad - Untitled".to_string(),
+            };
+            let suffix = match new_mode {
+                Mode::Plain => " [Plain]",
+                Mode::Markup => " [Markup]",
+            };
+            window.set_title(Some(&format!("{}{}", base_title, suffix)));
+        }
+    }
 }
 
 fn save_buffer_to_path(
@@ -489,13 +559,13 @@ fn open_with_dialog(window: &gtk::ApplicationWindow) {
         ],
     );
 
-    // Filter: Text Files (*.txt)
     let text_filter = FileFilter::new();
-    text_filter.set_name(Some("Text Files (*.txt)"));
+    text_filter.set_name(Some("Text Files (*.txt, *.md, *.markdown)"));
     text_filter.add_pattern("*.txt");
+    text_filter.add_pattern("*.md");
+    text_filter.add_pattern("*.markdown");
     dialog.add_filter(&text_filter);
 
-    // Filter: All Files (*)
     let all_filter = FileFilter::new();
     all_filter.set_name(Some("All Files"));
     all_filter.add_pattern("*");
@@ -522,7 +592,7 @@ fn open_with_dialog(window: &gtk::ApplicationWindow) {
 fn register_actions(
     app: &gtk::Application,
     window: &gtk::ApplicationWindow,
-    text_view: &gtk::TextView,) {
+    text_view: &sv::View,) {
     use gtk::gio::SimpleAction;
 
     // ----- File actions -----
@@ -840,19 +910,6 @@ fn register_actions(
     app.set_accels_for_action("app.select_all", &["<Primary>A"]);
     app.set_accels_for_action("app.time_date", &["F5"]);
 
-    // ----- Format actions (stubs) -----
-    let word_wrap = SimpleAction::new("word_wrap", None);
-    word_wrap.connect_activate(|_, _| {
-        eprintln!("Word Wrap toggle not implemented yet.");
-    });
-    app.add_action(&word_wrap);
-
-    let font = SimpleAction::new("font", None);
-    font.connect_activate(|_, _| {
-        eprintln!("Font dialog not implemented yet.");
-    });
-    app.add_action(&font);
-
     // ----- View actions (stubs) -----
     for (name, label) in [
         ("zoom_in",    "Zoom In"),
@@ -873,24 +930,26 @@ fn register_actions(
     });
     app.add_action(&status_bar);
 
-    // ----- Mode actions (your custom modes) -----
+    // ----- Mode actions -----
     let mode_plain = SimpleAction::new("mode_plain", None);
-    mode_plain.connect_activate(|_, _| {
-        eprintln!("Mode switched to Plain Text (not wired yet).");
-    });
+    {
+        let window_clone = window.clone();
+        let text_view_clone = text_view.clone();
+        mode_plain.connect_activate(move |_, _| {
+            change_mode_if_empty(&window_clone, &text_view_clone, Mode::Plain);
+        });
+    }
     app.add_action(&mode_plain);
 
     let mode_markup = SimpleAction::new("mode_markup", None);
-    mode_markup.connect_activate(|_, _| {
-        eprintln!("Mode switched to Markup (not wired yet).");
-    });
+    {
+        let window_clone = window.clone();
+        let text_view_clone = text_view.clone();
+        mode_markup.connect_activate(move |_, _| {
+            change_mode_if_empty(&window_clone, &text_view_clone, Mode::Markup);
+        });
+    }
     app.add_action(&mode_markup);
-
-    let mode_rich = SimpleAction::new("mode_rich", None);
-    mode_rich.connect_activate(|_, _| {
-        eprintln!("Mode switched to Rich Text (not wired yet).");
-    });
-    app.add_action(&mode_rich);
 
     // ----- Help actions (stubs) -----
     let view_help = SimpleAction::new("view_help", None);
@@ -908,7 +967,7 @@ fn register_actions(
 
 
 fn save_as_with_dialog(window: &gtk::ApplicationWindow) {
-    use gtk::{FileChooserAction, ResponseType};
+    use gtk::{FileChooserAction, FileFilter, ResponseType};
 
     let dialog = gtk::FileChooserDialog::new(
         Some("Save File"),
@@ -920,8 +979,30 @@ fn save_as_with_dialog(window: &gtk::ApplicationWindow) {
         ],
     );
 
-    // Default filename
-    dialog.set_current_name("Untitled.txt");
+    // Decide default name based on current mode
+    let mode = current_mode(window);
+    let default_name = match mode {
+        Mode::Plain => "Untitled.txt",
+        Mode::Markup => "Untitled.md",
+    };
+    dialog.set_current_name(default_name);
+
+    // Optional: filters match mode, but allow both
+    let text_filter = FileFilter::new();
+    text_filter.set_name(Some("Text Files (*.txt)"));
+    text_filter.add_pattern("*.txt");
+    dialog.add_filter(&text_filter);
+
+    let md_filter = FileFilter::new();
+    md_filter.set_name(Some("Markdown Files (*.md, *.markdown)"));
+    md_filter.add_pattern("*.md");
+    md_filter.add_pattern("*.markdown");
+    dialog.add_filter(&md_filter);
+
+    let all_filter = FileFilter::new();
+    all_filter.set_name(Some("All Files"));
+    all_filter.add_pattern("*");
+    dialog.add_filter(&all_filter);
 
     let window_clone = window.clone();
     dialog.connect_response(move |dialog, response| {
@@ -941,8 +1022,19 @@ fn save_as_with_dialog(window: &gtk::ApplicationWindow) {
     dialog.show();
 }
 
+fn current_mode(window: &gtk::ApplicationWindow) -> Mode {
+    unsafe {
+        if let Some(doc_state_ptr) = window.data::<DocumentState>("rpad-doc-state") {
+            let doc_state: &DocumentState = doc_state_ptr.as_ref();
+            doc_state.mode()
+        } else {
+            Mode::Plain
+        }
+    }
+}
+
 fn save_as_with_dialog_and_then_close(window: &gtk::ApplicationWindow) {
-    use gtk::{FileChooserAction, ResponseType};
+    use gtk::{FileChooserAction, FileFilter, ResponseType};
 
     let dialog = gtk::FileChooserDialog::new(
         Some("Save File"),
@@ -954,7 +1046,28 @@ fn save_as_with_dialog_and_then_close(window: &gtk::ApplicationWindow) {
         ],
     );
 
-    dialog.set_current_name("Untitled.txt");
+    let mode = current_mode(window);
+    let default_name = match mode {
+        Mode::Plain => "Untitled.txt",
+        Mode::Markup => "Untitled.md",
+    };
+    dialog.set_current_name(default_name);
+
+    let text_filter = FileFilter::new();
+    text_filter.set_name(Some("Text Files (*.txt)"));
+    text_filter.add_pattern("*.txt");
+    dialog.add_filter(&text_filter);
+
+    let md_filter = FileFilter::new();
+    md_filter.set_name(Some("Markdown Files (*.md, *.markdown)"));
+    md_filter.add_pattern("*.md");
+    md_filter.add_pattern("*.markdown");
+    dialog.add_filter(&md_filter);
+
+    let all_filter = FileFilter::new();
+    all_filter.set_name(Some("All Files"));
+    all_filter.add_pattern("*");
+    dialog.add_filter(&all_filter);
 
     let window_clone = window.clone();
     dialog.connect_response(move |dialog, response| {
@@ -963,7 +1076,6 @@ fn save_as_with_dialog_and_then_close(window: &gtk::ApplicationWindow) {
                 if let Some(path) = file.path() {
                     match save_buffer_to_path(&window_clone, path.as_ref()) {
                         Ok(()) => {
-                            // After successful save, close the window
                             window_clone.close();
                         }
                         Err(err) => {
@@ -980,9 +1092,37 @@ fn save_as_with_dialog_and_then_close(window: &gtk::ApplicationWindow) {
     dialog.show();
 }
 
+fn apply_language_for_mode(buffer: &sv::Buffer, mode: Mode) {
+    let lm = sv::LanguageManager::default();
+
+    match mode {
+        Mode::Plain => {
+            buffer.set_language(None::<&sv::Language>);
+        }
+        Mode::Markup => {
+            if let Some(lang) = lm.language("markdown") {
+                buffer.set_language(Some(&lang));
+            } else {
+                buffer.set_language(None::<&sv::Language>);
+            }
+        }
+    }
+}
+
+fn get_source_buffer_from_window(window: &gtk::ApplicationWindow) -> Option<sv::Buffer> {
+    unsafe {
+        if let Some(view_ptr) = window.data::<sv::View>("rpad-text-view") {
+            let view: &sv::View = view_ptr.as_ref();
+            Some(view.buffer()) // sv::Buffer, matches Option<sv::Buffer>
+        } else {
+            None
+        }
+    }
+}
+
 fn search_in_buffer(
-    buffer: &gtk::TextBuffer,
-    text_view: &gtk::TextView,
+    buffer: &sv::Buffer,
+    text_view: &sv::View,
     pattern: &str,
     forward: bool,
     match_case: bool,
@@ -1022,7 +1162,7 @@ fn search_in_buffer(
     }
 }
 
-fn do_find_next(window: &gtk::ApplicationWindow, text_view: &gtk::TextView) {
+fn do_find_next(window: &gtk::ApplicationWindow, text_view: &sv::View) {
     unsafe {
         if let Some(doc_state_ptr) = window.data::<DocumentState>("rpad-doc-state") {
             let doc_state: &DocumentState = doc_state_ptr.as_ref();
@@ -1031,13 +1171,13 @@ fn do_find_next(window: &gtk::ApplicationWindow, text_view: &gtk::TextView) {
                 return;
             }
             let match_case = *doc_state.match_case.borrow();
-            let buffer = text_view.buffer();
+            let buffer = text_view.buffer(); // sv::Buffer
             let _ = search_in_buffer(&buffer, text_view, &pattern, true, match_case);
         }
     }
 }
 
-fn do_find_prev(window: &gtk::ApplicationWindow, text_view: &gtk::TextView) {
+fn do_find_prev(window: &gtk::ApplicationWindow, text_view: &sv::View) {
     unsafe {
         if let Some(doc_state_ptr) = window.data::<DocumentState>("rpad-doc-state") {
             let doc_state: &DocumentState = doc_state_ptr.as_ref();
@@ -1046,13 +1186,13 @@ fn do_find_prev(window: &gtk::ApplicationWindow, text_view: &gtk::TextView) {
                 return;
             }
             let match_case = *doc_state.match_case.borrow();
-            let buffer = text_view.buffer();
+            let buffer = text_view.buffer(); // sv::Buffer
             let _ = search_in_buffer(&buffer, text_view, &pattern, false, match_case);
         }
     }
 }
 
-fn open_find_dialog(window: &gtk::ApplicationWindow, text_view: &gtk::TextView) {
+fn open_find_dialog(window: &gtk::ApplicationWindow, text_view: &sv::View) {
     let dialog = gtk::Dialog::builder()
         .transient_for(window)
         .modal(true)
@@ -1078,7 +1218,6 @@ fn open_find_dialog(window: &gtk::ApplicationWindow, text_view: &gtk::TextView) 
 
     let match_case_cb = gtk::CheckButton::with_label("Match case");
 
-    // pre-fill from last state if any
     unsafe {
         if let Some(doc_state_ptr) = window.data::<DocumentState>("rpad-doc-state") {
             let doc_state: &DocumentState = doc_state_ptr.as_ref();
@@ -1090,31 +1229,35 @@ fn open_find_dialog(window: &gtk::ApplicationWindow, text_view: &gtk::TextView) 
     content.append(&hbox);
     content.append(&match_case_cb);
 
-    dialog.connect_response(clone!(@weak window as win, @weak text_view, @weak entry, @weak match_case_cb =>
-        move |dialog, response| {
-            if response == gtk::ResponseType::Accept {
-                let text = entry.text().to_string();
-                let match_case = match_case_cb.is_active();
+    let win_clone = window.clone();
+    let text_view_clone = text_view.clone();
+    let entry_clone = entry.clone();
+    let match_case_cb_clone = match_case_cb.clone();
 
-                unsafe {
-                    if let Some(doc_state_ptr) = win.data::<DocumentState>("rpad-doc-state") {
-                        let doc_state: &DocumentState = doc_state_ptr.as_ref();
-                        *doc_state.find_text.borrow_mut() = text.clone();
-                        *doc_state.match_case.borrow_mut() = match_case;
-                    }
+    dialog.connect_response(move |dialog, response| {
+        if response == gtk::ResponseType::Accept {
+            let text = entry_clone.text().to_string();
+            let match_case = match_case_cb_clone.is_active();
+
+            unsafe {
+                if let Some(doc_state_ptr) = win_clone.data::<DocumentState>("rpad-doc-state") {
+                    let doc_state: &DocumentState = doc_state_ptr.as_ref();
+                    *doc_state.find_text.borrow_mut() = text.clone();
+                    *doc_state.match_case.borrow_mut() = match_case;
                 }
-
-                let buffer = text_view.buffer();
-                let _ = search_in_buffer(&buffer, &text_view, &text, true, match_case);
             }
-            dialog.close();
+
+            let buffer = text_view_clone.buffer(); // sv::Buffer
+            let _ = search_in_buffer(&buffer, &text_view_clone, &text, true, match_case);
         }
-    ));
+        dialog.close();
+    });
 
     dialog.show();
 }
 
-fn open_replace_dialog(window: &gtk::ApplicationWindow, text_view: &gtk::TextView) {
+
+fn open_replace_dialog(window: &gtk::ApplicationWindow, text_view: &sv::View) {
     let dialog = gtk::Dialog::builder()
         .transient_for(window)
         .modal(true)
@@ -1149,7 +1292,6 @@ fn open_replace_dialog(window: &gtk::ApplicationWindow, text_view: &gtk::TextVie
 
     let match_case_cb = gtk::CheckButton::with_label("Match case");
 
-    // pre-fill from state
     unsafe {
         if let Some(doc_state_ptr) = window.data::<DocumentState>("rpad-doc-state") {
             let doc_state: &DocumentState = doc_state_ptr.as_ref();
@@ -1162,40 +1304,44 @@ fn open_replace_dialog(window: &gtk::ApplicationWindow, text_view: &gtk::TextVie
     content.append(&replace_box);
     content.append(&match_case_cb);
 
-    dialog.connect_response(clone!(@weak window as win, @weak text_view, @weak find_entry, @weak replace_entry, @weak match_case_cb =>
-        move |dialog, response| {
-            if response == gtk::ResponseType::Accept {
-                let find_text = find_entry.text().to_string();
-                let replace_text = replace_entry.text().to_string();
-                let match_case = match_case_cb.is_active();
+    let win_clone = window.clone();
+    let text_view_clone = text_view.clone();
+    let find_entry_clone = find_entry.clone();
+    let replace_entry_clone = replace_entry.clone();
+    let match_case_cb_clone = match_case_cb.clone();
 
-                unsafe {
-                    if let Some(doc_state_ptr) = win.data::<DocumentState>("rpad-doc-state") {
-                        let doc_state: &DocumentState = doc_state_ptr.as_ref();
-                        *doc_state.find_text.borrow_mut() = find_text.clone();
-                        *doc_state.match_case.borrow_mut() = match_case;
-                    }
-                }
+    dialog.connect_response(move |dialog, response| {
+        if response == gtk::ResponseType::Accept {
+            let find_text = find_entry_clone.text().to_string();
+            let replace_text = replace_entry_clone.text().to_string();
+            let match_case = match_case_cb_clone.is_active();
 
-                let buffer = text_view.buffer();
-
-                if let Some((mut start, mut end)) =
-                    search_in_buffer(&buffer, &text_view, &find_text, true, match_case)
-                {
-                    buffer.begin_user_action();
-                    buffer.delete(&mut start, &mut end);
-                    buffer.insert(&mut start, &replace_text);
-                    buffer.end_user_action();
+            unsafe {
+                if let Some(doc_state_ptr) = win_clone.data::<DocumentState>("rpad-doc-state") {
+                    let doc_state: &DocumentState = doc_state_ptr.as_ref();
+                    *doc_state.find_text.borrow_mut() = find_text.clone();
+                    *doc_state.match_case.borrow_mut() = match_case;
                 }
             }
-            dialog.close();
+
+            let buffer = text_view_clone.buffer(); // sv::Buffer
+
+            if let Some((mut start, mut end)) =
+                search_in_buffer(&buffer, &text_view_clone, &find_text, true, match_case)
+            {
+                buffer.begin_user_action();
+                buffer.delete(&mut start, &mut end);
+                buffer.insert(&mut start, &replace_text);
+                buffer.end_user_action();
+            }
         }
-    ));
+        dialog.close();
+    });
 
     dialog.show();
 }
 
-fn open_goto_dialog(window: &gtk::ApplicationWindow, text_view: &gtk::TextView) {
+fn open_goto_dialog(window: &gtk::ApplicationWindow, text_view: &sv::View) {
     let dialog = gtk::Dialog::builder()
         .transient_for(window)
         .modal(true)
@@ -1220,15 +1366,14 @@ fn open_goto_dialog(window: &gtk::ApplicationWindow, text_view: &gtk::TextView) 
     hbox.append(&entry);
     content.append(&hbox);
 
-    // Clone widgets into the closure instead of using clone! macro
     let text_view_clone = text_view.clone();
     let entry_clone = entry.clone();
 
     dialog.connect_response(move |dialog, response| {
         if response == gtk::ResponseType::Accept {
             if let Ok(line_num) = entry_clone.text().parse::<i32>() {
-                let buffer = text_view_clone.buffer();
-                let mut line = line_num - 1; // 1-based → 0-based
+                let buffer = text_view_clone.buffer().upcast::<gtk::TextBuffer>();
+                let mut line = line_num - 1;
                 let max_lines = buffer.line_count();
 
                 if max_lines > 0 {
@@ -1239,7 +1384,6 @@ fn open_goto_dialog(window: &gtk::ApplicationWindow, text_view: &gtk::TextView) 
                         line = max_lines - 1;
                     }
 
-                    // Compute iter manually
                     let mut iter = buffer.start_iter();
                     if line > 0 {
                         iter.forward_lines(line);
@@ -1256,4 +1400,3 @@ fn open_goto_dialog(window: &gtk::ApplicationWindow, text_view: &gtk::TextView) 
 
     dialog.show();
 }
-
