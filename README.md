@@ -1,10 +1,3 @@
-Here is a clean **README.md** you can drop directly into your `rpad` repository.
-Short, semi-professional, focused on the actual behavior of your GTK4 Rust notepad, including the recent features you implemented (save, save-as, close-confirmation, cut/copy/paste, find/replace).
-
-If you want sections for screenshots, packaging, or a full architecture diagram, say so and I’ll extend it.
-
----
-
 ```markdown
 # rpad  
 A lightweight Rust notepad built with GTK4.  
@@ -43,11 +36,6 @@ enum Mode { Plain, Markup, Rich }
 ```
 src/
   main.rs          → Application bootstrap, menu actions, window setup
-  file.rs          → File open/save, unsaved change checks
-  edit.rs          → Cut/copy/paste/delete helpers
-  search.rs        → Find / replace implementation
-  modes.rs         → ModeArg ↔ Mode conversions
-  util.rs          → Shared helpers
 ```
 
 ## Build & Run
@@ -78,7 +66,6 @@ cargo run -- [options]
 
   * `.txt` (default)
   * `.md`
-  * `.rt` (placeholder for rich-text support)
 
 ## Close Confirmation
 
@@ -95,10 +82,10 @@ Future enhancement: scoped replace (selection-only).
 ## Roadmap
 
 * Syntax highlighting for Markdown
-* Basic rich-text mode
 * Preferences dialog
 * Session restore
 * Cross-platform packaging (Flatpak, dmg, exe)
+* Sudo mode indicator
 
 ## Development Notes
 
