@@ -548,7 +548,7 @@ fn save_buffer_to_path(
                 if expired {
                     // Re-prompt
                     if let Some(new_pass) = prompt_for_password(window) {
-                        if validate_sudo_password(&new_pass) {
+                        if validate_sudo_password(&new_pass).is_ok() {
                             *doc_state.sudo_password.borrow_mut() = Some(new_pass.clone());
                             *doc_state.sudo_expiry.borrow_mut() = Some(
                                 std::time::Instant::now() + std::time::Duration::from_secs(300),
@@ -1223,34 +1223,34 @@ fn register_actions(app: &gtk::Application, window: &gtk::ApplicationWindow, tex
                     if new_state {
                         // Enable
                         if let Some(password) = prompt_for_password(&window_clone) {
-                            if validate_sudo_password(&password) {
-                                *doc_state.sudo_password.borrow_mut() = Some(password);
-                                *doc_state.sudo_expiry.borrow_mut() = Some(
-                                    std::time::Instant::now() + std::time::Duration::from_secs(300),
-                                );
+                            match validate_sudo_password(&password) {
+                                Ok(_) => {
+                                    *doc_state.sudo_password.borrow_mut() = Some(password);
+                                    *doc_state.sudo_expiry.borrow_mut() = Some(
+                                        std::time::Instant::now()
+                                            + std::time::Duration::from_secs(300),
+                                    );
 
-                                // Success: apply state
-                                action.set_state(&new_state.into());
+                                    // Success: apply state
+                                    action.set_state(&new_state.into());
 
-                                // Update UI manually (or let set_sudo_state do it, but we already set action state above)
-                                // set_sudo_state does: Title, Label, Action State.
-                                // We can just call set_sudo_state(&window_clone, true);
-                                // BUT set_sudo_state sets action state too. It's safe if it checks value,
-                                // but simpler to just do UI updates here or call a UI-only helper.
-                                // Let's use set_sudo_state but rely on its check (it won't hurt to set state again to same value).
-                                set_sudo_state(&window_clone, true);
-                            } else {
-                                // Invalid password: do NOT set state.
-                                // Menu item remains unchecked (reverts).
-                                let dialog = gtk::MessageDialog::builder()
-                                    .transient_for(&window_clone)
-                                    .modal(true)
-                                    .message_type(gtk::MessageType::Error)
-                                    .buttons(gtk::ButtonsType::Ok)
-                                    .text("Invalid Password")
-                                    .build();
-                                dialog.connect_response(|d, _| d.close());
-                                dialog.show();
+                                    eprintln!("Sudo activated. Setting state to true.");
+                                    set_sudo_state(&window_clone, true);
+                                }
+                                Err(err_msg) => {
+                                    eprintln!("Sudo validation returned error: {}", err_msg);
+                                    // Invalid password: do NOT set state.
+                                    let dialog = gtk::MessageDialog::builder()
+                                        .transient_for(&window_clone)
+                                        .modal(true)
+                                        .message_type(gtk::MessageType::Error)
+                                        .buttons(gtk::ButtonsType::Ok)
+                                        .text("Sudo Validation Failed")
+                                        .secondary_text(&err_msg)
+                                        .build();
+                                    dialog.connect_response(|d, _| d.close());
+                                    dialog.show();
+                                }
                             }
                         }
                         // If cancelled, do nothing (state remains false)
@@ -1418,18 +1418,24 @@ fn prompt_for_password(window: &gtk::ApplicationWindow) -> Option<String> {
     None
 }
 
-fn validate_sudo_password(password: &str) -> bool {
+fn validate_sudo_password(password: &str) -> Result<(), String> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
+    // Debug logging
+    eprintln!("Validating sudo password...");
+
+    // 1. Invalidate credentials first (sudo -k)
+    let _ = Command::new("sudo").arg("-k").status();
+
+    // 2. Validate with input (sudo -S -v)
     // sudo -S -v reads password from stdin and validates/updates timestamp
     let child = Command::new("sudo")
         .arg("-S")
         .arg("-v")
-        .arg("-k") // -k ignores cached credentials, forcing validation of the provided password
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped()) // Capture stderr
         .spawn();
 
     match child {
@@ -1437,12 +1443,33 @@ fn validate_sudo_password(password: &str) -> bool {
             if let Some(mut stdin) = child.stdin.take() {
                 let _ = stdin.write_all(format!("{}\n", password).as_bytes());
             }
-            match child.wait() {
-                Ok(status) => status.success(),
-                Err(_) => false,
+            match child.wait_with_output() {
+                Ok(output) => {
+                    if output.status.success() {
+                        eprintln!("Sudo validation successful.");
+                        Ok(())
+                    } else {
+                        let err_msg = String::from_utf8_lossy(&output.stderr).to_string();
+                        eprintln!("Sudo validation failed: {}", err_msg);
+                        Err(if err_msg.trim().is_empty() {
+                            "Validation failed (unknown error)".to_string()
+                        } else {
+                            err_msg
+                        })
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("Failed to wait on sudo: {}", e);
+                    eprintln!("{}", msg);
+                    Err(msg)
+                }
             }
         }
-        Err(_) => false,
+        Err(e) => {
+            let msg = format!("Failed to spawn sudo: {}", e);
+            eprintln!("{}", msg);
+            Err(msg)
+        }
     }
 }
 
