@@ -98,12 +98,8 @@ impl DocumentState {
                 Mode::Markup => "Markdown",
             })),
             label_sudo: {
-                let l = gtk::Label::new(Some("SUDO"));
-                // Style it: bold red
-                let attr_list = gtk::pango::AttrList::new();
-                attr_list.insert(gtk::pango::AttrColor::new_foreground(65535, 0, 0)); // Red
-                attr_list.insert(gtk::pango::AttrInt::new_weight(gtk::pango::Weight::Bold));
-                l.set_attributes(Some(&attr_list));
+                let l = gtk::Label::new(None);
+                l.set_markup("<span weight='bold' foreground='red'>SUDO</span>");
                 l.set_visible(false); // Hidden by default
                 l
             },
@@ -1542,7 +1538,9 @@ fn set_sudo_state(window: &gtk::ApplicationWindow, active: bool) {
             if let Some(app) = window.application() {
                 if let Some(action) = app.lookup_action("sudo_mode") {
                     if let Some(stateful_action) = action.downcast_ref::<gio::SimpleAction>() {
-                        stateful_action.set_state(&active.into());
+                        if stateful_action.state() != Some(active.to_variant()) {
+                            stateful_action.set_state(&active.into());
+                        }
                     }
                 }
             }
